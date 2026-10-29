@@ -18,25 +18,42 @@ import (
 
 // Server is a TCP server with RESP protocol support.
 type Server struct {
-	engine  *engine.LSMEngine
-	addr    string
-	lists   map[string][][]byte
-	hashes  map[string]map[string][]byte
-	sets    map[string]map[string]struct{}
-	ttls    map[string]float64 // key -> expiry timestamp
-	mu      sync.RWMutex
-	running bool
+	engine     *engine.LSMEngine
+	addr       string
+	lists      map[string][][]byte
+	hashes     map[string]map[string][]byte
+	sets       map[string]map[string]struct{}
+	ttls       map[string]float64
+	sortedSets map[string]*sortedSet // in-memory sorted sets
+	searchDocs map[string]string     // doc_id -> text
+	searchIdx  map[string]map[string]int // term -> {doc_id: freq}
+	mu         sync.RWMutex
+	running    bool
+}
+
+// sortedSet is a simple in-memory sorted set for ZSET commands.
+type sortedSet struct {
+	members map[string]float64
+	sorted  []ssMember
+}
+
+type ssMember struct {
+	score  float64
+	member string
 }
 
 // New creates a new RESP server.
 func New(eng *engine.LSMEngine, addr string) *Server {
 	return &Server{
-		engine: eng,
-		addr:   addr,
-		lists:  make(map[string][][]byte),
-		hashes: make(map[string]map[string][]byte),
-		sets:   make(map[string]map[string]struct{}),
-		ttls:   make(map[string]float64),
+		engine:     eng,
+		addr:       addr,
+		lists:      make(map[string][][]byte),
+		hashes:     make(map[string]map[string][]byte),
+		sets:       make(map[string]map[string]struct{}),
+		ttls:       make(map[string]float64),
+		sortedSets: make(map[string]*sortedSet),
+		searchDocs: make(map[string]string),
+		searchIdx:  make(map[string]map[string]int),
 	}
 }
 
@@ -430,20 +447,33 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 		s.mu.Unlock()
 		return count
 
-	// === Sorted Set Commands ===
+	// === Sorted Set Commands (in-memory) ===
 	case "ZADD":
 		if len(args) < 3 || len(args)%2 == 0 {
 			return fmt.Errorf("wrong number of arguments for 'zadd'")
 		}
-		key := args[0]
+		key := string(args[0])
 		count := int64(0)
+		s.mu.Lock()
+		ss := s.sortedSets[key]
+		if ss == nil {
+			ss = &sortedSet{members: make(map[string]float64)}
+			s.sortedSets[key] = ss
+		}
 		for i := 1; i < len(args); i += 2 {
 			score, err := strconv.ParseFloat(string(args[i]), 64)
 			if err != nil {
+				s.mu.Unlock()
 				return fmt.Errorf("invalid score: %v", err)
 			}
-			count += int64(s.engine.ZAdd(key, score, args[i+1]))
+			member := string(args[i+1])
+			if _, exists := ss.members[member]; !exists {
+				count++
+			}
+			ss.members[member] = score
 		}
+		ss.rebuildSorted()
+		s.mu.Unlock()
 		return count
 
 	case "ZRANGE":
@@ -452,10 +482,17 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 		}
 		start, _ := strconv.Atoi(string(args[1]))
 		stop, _ := strconv.Atoi(string(args[2]))
-		members := s.engine.ZRange(args[0], start, stop)
+		s.mu.RLock()
+		ss := s.sortedSets[string(args[0])]
+		if ss == nil {
+			s.mu.RUnlock()
+			return []interface{}{}
+		}
+		members := ss.rangeByRank(start, stop, false)
+		s.mu.RUnlock()
 		result := make([]interface{}, len(members))
 		for i, m := range members {
-			result[i] = m
+			result[i] = []byte(m)
 		}
 		return result
 
@@ -465,10 +502,17 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 		}
 		start, _ := strconv.Atoi(string(args[1]))
 		stop, _ := strconv.Atoi(string(args[2]))
-		members := s.engine.ZRevRange(args[0], start, stop)
+		s.mu.RLock()
+		ss := s.sortedSets[string(args[0])]
+		if ss == nil {
+			s.mu.RUnlock()
+			return []interface{}{}
+		}
+		members := ss.rangeByRank(start, stop, true)
+		s.mu.RUnlock()
 		result := make([]interface{}, len(members))
 		for i, m := range members {
-			result[i] = m
+			result[i] = []byte(m)
 		}
 		return result
 
@@ -486,10 +530,17 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 				break
 			}
 		}
-		members := s.engine.ZRangeByScore(args[0], minScore, maxScore, offset, limit)
+		s.mu.RLock()
+		ss := s.sortedSets[string(args[0])]
+		if ss == nil {
+			s.mu.RUnlock()
+			return []interface{}{}
+		}
+		members := ss.rangeByScore(minScore, maxScore, offset, limit, false)
+		s.mu.RUnlock()
 		result := make([]interface{}, len(members))
 		for i, m := range members {
-			result[i] = m
+			result[i] = []byte(m)
 		}
 		return result
 
@@ -507,10 +558,17 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 				break
 			}
 		}
-		members := s.engine.ZRevRangeByScore(args[0], maxScore, minScore, offset, limit)
+		s.mu.RLock()
+		ss := s.sortedSets[string(args[0])]
+		if ss == nil {
+			s.mu.RUnlock()
+			return []interface{}{}
+		}
+		members := ss.rangeByScore(minScore, maxScore, offset, limit, true)
+		s.mu.RUnlock()
 		result := make([]interface{}, len(members))
 		for i, m := range members {
-			result[i] = m
+			result[i] = []byte(m)
 		}
 		return result
 
@@ -518,7 +576,14 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 		if len(args) != 2 {
 			return fmt.Errorf("wrong number of arguments for 'zscore'")
 		}
-		score, ok := s.engine.ZScore(args[0], args[1])
+		s.mu.RLock()
+		ss := s.sortedSets[string(args[0])]
+		if ss == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		score, ok := ss.members[string(args[1])]
+		s.mu.RUnlock()
 		if !ok {
 			return nil
 		}
@@ -528,19 +593,39 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 		if len(args) < 2 {
 			return fmt.Errorf("wrong number of arguments for 'zrem'")
 		}
+		s.mu.Lock()
+		ss := s.sortedSets[string(args[0])]
 		count := int64(0)
-		for _, member := range args[1:] {
-			count += int64(s.engine.ZRem(args[0], member))
+		if ss != nil {
+			for _, member := range args[1:] {
+				m := string(member)
+				if _, ok := ss.members[m]; ok {
+					delete(ss.members, m)
+					count++
+				}
+			}
+			if count > 0 {
+				ss.rebuildSorted()
+			}
 		}
+		s.mu.Unlock()
 		return count
 
 	case "ZCARD":
 		if len(args) != 1 {
 			return fmt.Errorf("wrong number of arguments for 'zcard'")
 		}
-		return int64(s.engine.ZCard(args[0]))
+		s.mu.RLock()
+		ss := s.sortedSets[string(args[0])]
+		if ss == nil {
+			s.mu.RUnlock()
+			return int64(0)
+		}
+		n := int64(len(ss.members))
+		s.mu.RUnlock()
+		return n
 
-	// === Full-Text Search Commands ===
+	// === Full-Text Search Commands (in-memory) ===
 	case "FT.ADD":
 		if len(args) < 2 {
 			return fmt.Errorf("wrong number of arguments for 'ft.add'")
@@ -551,14 +636,24 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 			parts[i] = string(a)
 		}
 		text := strings.Join(parts, " ")
-		s.engine.FTAdd(docID, text)
+		s.mu.Lock()
+		s.searchDocs[docID] = text
+		// Simple tokenization and indexing
+		tokens := strings.Fields(strings.ToLower(text))
+		for _, token := range tokens {
+			if s.searchIdx[token] == nil {
+				s.searchIdx[token] = make(map[string]int)
+			}
+			s.searchIdx[token][docID]++
+		}
+		s.mu.Unlock()
 		return "OK"
 
 	case "FT.SEARCH":
 		if len(args) < 1 {
 			return fmt.Errorf("wrong number of arguments for 'ft.search'")
 		}
-		query := string(args[0])
+		query := strings.ToLower(string(args[0]))
 		limit := 20
 		for i := 1; i < len(args); i++ {
 			if strings.ToUpper(string(args[i])) == "LIMIT" && i+1 < len(args) {
@@ -566,10 +661,41 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 				break
 			}
 		}
-		results := s.engine.FTSearch(query, limit)
+		s.mu.RLock()
+		// Score documents by term frequency
+		scores := make(map[string]float64)
+		tokens := strings.Fields(query)
+		for _, token := range tokens {
+			if docs, ok := s.searchIdx[token]; ok {
+				for docID, freq := range docs {
+					scores[docID] += float64(freq)
+				}
+			}
+		}
+		// Sort by score descending
+		type result struct {
+			docID string
+			score float64
+		}
+		results := make([]result, 0, len(scores))
+		for docID, score := range scores {
+			results = append(results, result{docID, score})
+		}
+		s.mu.RUnlock()
+		// Simple sort
+		for i := 0; i < len(results); i++ {
+			for j := i + 1; j < len(results); j++ {
+				if results[j].score > results[i].score {
+					results[i], results[j] = results[j], results[i]
+				}
+			}
+		}
+		if len(results) > limit {
+			results = results[:limit]
+		}
 		flat := make([]interface{}, 0, len(results)*2)
 		for _, r := range results {
-			flat = append(flat, []byte(r.DocID), []byte(strconv.FormatFloat(r.Score, 'f', -1, 64)))
+			flat = append(flat, []byte(r.docID), []byte(strconv.FormatFloat(r.score, 'f', -1, 64)))
 		}
 		return flat
 
@@ -641,6 +767,86 @@ func (s *Server) execute(cmd string, args [][]byte) interface{} {
 	default:
 		return fmt.Errorf("unknown command '%s'", cmd)
 	}
+}
+
+// === Sorted Set Helpers ===
+
+func (ss *sortedSet) rebuildSorted() {
+	ss.sorted = make([]ssMember, 0, len(ss.members))
+	for m, s := range ss.members {
+		ss.sorted = append(ss.sorted, ssMember{score: s, member: m})
+	}
+	// Sort by score asc, then member asc
+	for i := 0; i < len(ss.sorted); i++ {
+		for j := i + 1; j < len(ss.sorted); j++ {
+			if ss.sorted[j].score < ss.sorted[i].score ||
+				(ss.sorted[j].score == ss.sorted[i].score && ss.sorted[j].member < ss.sorted[i].member) {
+				ss.sorted[i], ss.sorted[j] = ss.sorted[j], ss.sorted[i]
+			}
+		}
+	}
+}
+
+func (ss *sortedSet) rangeByRank(start, stop int, reverse bool) []string {
+	n := len(ss.sorted)
+	if n == 0 {
+		return nil
+	}
+	if start < 0 {
+		start += n
+	}
+	if stop < 0 {
+		stop += n
+	}
+	if start < 0 {
+		start = 0
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	if start > stop || start >= n {
+		return nil
+	}
+	result := make([]string, 0, stop-start+1)
+	if reverse {
+		for i := stop; i >= start; i-- {
+			result = append(result, ss.sorted[n-1-i].member)
+		}
+	} else {
+		for i := start; i <= stop; i++ {
+			result = append(result, ss.sorted[i].member)
+		}
+	}
+	return result
+}
+
+func (ss *sortedSet) rangeByScore(minS, maxS float64, offset, limit int, reverse bool) []string {
+	var filtered []ssMember
+	for _, m := range ss.sorted {
+		if m.score >= minS && m.score <= maxS {
+			filtered = append(filtered, m)
+		}
+	}
+	if reverse {
+		// Reverse the filtered list
+		for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
+			filtered[i], filtered[j] = filtered[j], filtered[i]
+		}
+	}
+	if offset > 0 {
+		if offset >= len(filtered) {
+			return nil
+		}
+		filtered = filtered[offset:]
+	}
+	if limit >= 0 && limit < len(filtered) {
+		filtered = filtered[:limit]
+	}
+	result := make([]string, len(filtered))
+	for i, m := range filtered {
+		result[i] = m.member
+	}
+	return result
 }
 
 func parseScoreArg(s string) float64 {

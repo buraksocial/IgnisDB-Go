@@ -142,7 +142,7 @@ func (w *WAL) Append(key, value []byte, entryType uint8) error {
 
 	// Zero-allocation WAL write using pooled buffer.
 	// The pool ensures amortized zero allocs after warmup.
-	entrySize := 1 + 4 + keyLen + 4 + valueLen
+	entrySize = 1 + 4 + keyLen + 4 + valueLen
 
 	pooled := walBufPool.Get().(*[]byte)
 	if cap(*pooled) < entrySize {

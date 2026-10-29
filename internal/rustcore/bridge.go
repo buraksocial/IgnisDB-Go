@@ -1,5 +1,5 @@
-// Package rustcore provides CGo bindings to the Rust IgnisDB core library.
-// This enables high-performance lock-free operations from Go.
+// Package rustcore provides CGo bindings to the complete Rust LSM Engine.
+// All storage operations are delegated to Rust - Go is a thin wrapper only.
 package rustcore
 
 /*
@@ -7,63 +7,70 @@ package rustcore
 #include <stdlib.h>
 #include <stdint.h>
 
-// SortedMap
-typedef void* SortedMapPtr;
-SortedMapPtr ignis_sorted_map_new();
-void ignis_sorted_map_free(SortedMapPtr ptr);
-void ignis_sorted_map_put(SortedMapPtr ptr, const uint8_t* key, size_t key_len, const uint8_t* value, size_t value_len);
-int32_t ignis_sorted_map_get(SortedMapPtr ptr, const uint8_t* key, size_t key_len, uint8_t** out_value, size_t* out_len);
-int32_t ignis_sorted_map_delete(SortedMapPtr ptr, const uint8_t* key, size_t key_len);
-size_t ignis_sorted_map_len(SortedMapPtr ptr);
-void ignis_sorted_map_iter_all(SortedMapPtr ptr, uint8_t** out_data, size_t* out_len);
-void ignis_free_bytes(uint8_t* ptr, size_t len);
+typedef void* EnginePtr;
 
-// BloomFilter
-typedef void* BloomPtr;
-BloomPtr ignis_bloom_new(size_t expected_items, double fp_rate);
-void ignis_bloom_free(BloomPtr ptr);
-void ignis_bloom_add(BloomPtr ptr, const uint8_t* key, size_t key_len);
-int32_t ignis_bloom_might_contain(BloomPtr ptr, const uint8_t* key, size_t key_len);
+EnginePtr ignis_engine_open(const uint8_t* data_dir, size_t data_dir_len, uint64_t memtable_size_limit, size_t cache_size);
+int32_t ignis_engine_close(EnginePtr ptr);
+int32_t ignis_engine_put(EnginePtr ptr, const uint8_t* key, size_t key_len, const uint8_t* value, size_t value_len);
+int32_t ignis_engine_get(EnginePtr ptr, const uint8_t* key, size_t key_len, uint8_t** out_value, size_t* out_len);
+int32_t ignis_engine_delete(EnginePtr ptr, const uint8_t* key, size_t key_len);
+int32_t ignis_engine_flush(EnginePtr ptr);
+int32_t ignis_engine_compact(EnginePtr ptr);
+size_t ignis_engine_memtable_len(EnginePtr ptr);
+uint64_t ignis_engine_memtable_bytes(EnginePtr ptr);
+size_t ignis_engine_sstable_count(EnginePtr ptr);
+uint64_t ignis_engine_stats_writes(EnginePtr ptr);
+uint64_t ignis_engine_stats_reads(EnginePtr ptr);
+uint64_t ignis_engine_stats_cache_hits(EnginePtr ptr);
+uint64_t ignis_engine_stats_cache_misses(EnginePtr ptr);
+void ignis_free_bytes(uint8_t* ptr, size_t len);
 */
 import "C"
 import (
-	"encoding/binary"
+	"fmt"
 	"runtime"
 	"unsafe"
 )
 
-// ============================================================
-// SortedMap - Lock-free sorted map backed by Rust BTreeMap
-// ============================================================
-
-// SortedMap is a high-performance sorted map backed by Rust.
-type SortedMap struct {
-	ptr C.SortedMapPtr
+// Engine wraps the Rust LSM Engine via CGo.
+type Engine struct {
+	ptr C.EnginePtr
 }
 
-// NewSortedMap creates a new Rust-backed sorted map.
-func NewSortedMap() *SortedMap {
-	sm := &SortedMap{
-		ptr: C.ignis_sorted_map_new(),
+// Open opens or creates an LSM engine.
+func Open(dataDir string, memtableSizeLimit uint64, cacheSize int) (*Engine, error) {
+	dirBytes := []byte(dataDir)
+	ptr := C.ignis_engine_open(
+		(*C.uint8_t)(unsafe.Pointer(&dirBytes[0])),
+		C.size_t(len(dirBytes)),
+		C.uint64_t(memtableSizeLimit),
+		C.size_t(cacheSize),
+	)
+	if ptr == nil {
+		return nil, fmt.Errorf("failed to open engine at %s", dataDir)
 	}
-	runtime.SetFinalizer(sm, func(sm *SortedMap) {
-		sm.Free()
-	})
-	return sm
+	e := &Engine{ptr: ptr}
+	runtime.SetFinalizer(e, func(e *Engine) { e.Close() })
+	return e, nil
 }
 
-// Free releases the Rust-side memory.
-func (sm *SortedMap) Free() {
-	if sm.ptr != nil {
-		C.ignis_sorted_map_free(sm.ptr)
-		sm.ptr = nil
+// Close shuts down the engine.
+func (e *Engine) Close() error {
+	if e.ptr == nil {
+		return nil
 	}
+	ret := C.ignis_engine_close(e.ptr)
+	e.ptr = nil
+	if ret != 0 {
+		return fmt.Errorf("engine close failed")
+	}
+	return nil
 }
 
-// Put inserts or updates a key-value pair.
-func (sm *SortedMap) Put(key, value []byte) {
-	if sm.ptr == nil {
-		return
+// Put writes a key-value pair.
+func (e *Engine) Put(key, value []byte) error {
+	if e.ptr == nil {
+		return fmt.Errorf("engine closed")
 	}
 	var kp, vp *C.uint8_t
 	if len(key) > 0 {
@@ -72,12 +79,16 @@ func (sm *SortedMap) Put(key, value []byte) {
 	if len(value) > 0 {
 		vp = (*C.uint8_t)(unsafe.Pointer(&value[0]))
 	}
-	C.ignis_sorted_map_put(sm.ptr, kp, C.size_t(len(key)), vp, C.size_t(len(value)))
+	ret := C.ignis_engine_put(e.ptr, kp, C.size_t(len(key)), vp, C.size_t(len(value)))
+	if ret != 0 {
+		return fmt.Errorf("put failed")
+	}
+	return nil
 }
 
 // Get retrieves a value by key.
-func (sm *SortedMap) Get(key []byte) ([]byte, bool) {
-	if sm.ptr == nil {
+func (e *Engine) Get(key []byte) ([]byte, bool) {
+	if e.ptr == nil {
 		return nil, false
 	}
 	var kp *C.uint8_t
@@ -86,126 +97,107 @@ func (sm *SortedMap) Get(key []byte) ([]byte, bool) {
 	}
 	var outVal *C.uint8_t
 	var outLen C.size_t
-	found := C.ignis_sorted_map_get(sm.ptr, kp, C.size_t(len(key)), &outVal, &outLen)
+	found := C.ignis_engine_get(e.ptr, kp, C.size_t(len(key)), &outVal, &outLen)
 	if found == 0 || outVal == nil {
 		return nil, false
 	}
-	// Copy to Go-managed memory
 	result := C.GoBytes(unsafe.Pointer(outVal), C.int(outLen))
 	C.ignis_free_bytes(outVal, outLen)
 	return result, true
 }
 
 // Delete removes a key.
-func (sm *SortedMap) Delete(key []byte) bool {
-	if sm.ptr == nil {
-		return false
+func (e *Engine) Delete(key []byte) error {
+	if e.ptr == nil {
+		return fmt.Errorf("engine closed")
 	}
 	var kp *C.uint8_t
 	if len(key) > 0 {
 		kp = (*C.uint8_t)(unsafe.Pointer(&key[0]))
 	}
-	return C.ignis_sorted_map_delete(sm.ptr, kp, C.size_t(len(key))) != 0
+	ret := C.ignis_engine_delete(e.ptr, kp, C.size_t(len(key)))
+	if ret != 0 {
+		return fmt.Errorf("delete failed")
+	}
+	return nil
 }
 
-// Len returns the number of entries.
-func (sm *SortedMap) Len() int {
-	if sm.ptr == nil {
+// Flush forces a memtable flush to SSTable.
+func (e *Engine) Flush() error {
+	if e.ptr == nil {
+		return fmt.Errorf("engine closed")
+	}
+	ret := C.ignis_engine_flush(e.ptr)
+	if ret != 0 {
+		return fmt.Errorf("flush failed")
+	}
+	return nil
+}
+
+// Compact triggers SSTable compaction.
+func (e *Engine) Compact() error {
+	if e.ptr == nil {
+		return fmt.Errorf("engine closed")
+	}
+	ret := C.ignis_engine_compact(e.ptr)
+	if ret != 0 {
+		return fmt.Errorf("compact failed")
+	}
+	return nil
+}
+
+// MemtableLen returns the number of entries in the memtable.
+func (e *Engine) MemtableLen() int {
+	if e.ptr == nil {
 		return 0
 	}
-	return int(C.ignis_sorted_map_len(sm.ptr))
+	return int(C.ignis_engine_memtable_len(e.ptr))
 }
 
-// IterAllFunc calls fn for each key-value pair in sorted order.
-// This avoids allocating a Go slice for the entire dataset.
-func (sm *SortedMap) IterAllFunc(fn func(key, value []byte)) {
-	if sm.ptr == nil {
-		return
+// MemtableBytes returns the approximate memtable size in bytes.
+func (e *Engine) MemtableBytes() uint64 {
+	if e.ptr == nil {
+		return 0
 	}
-	// Get flat buffer from Rust: [key_len(4)][key][value_len(4)][value]...
-	var outPtr *C.uint8_t
-	var outLen C.size_t
-	C.ignis_sorted_map_iter_all(sm.ptr, &outPtr, &outLen)
-	if outPtr == nil || outLen == 0 {
-		return
-	}
-	data := C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen))
-	C.ignis_free_bytes(outPtr, outLen)
-
-	// Parse flat buffer
-	pos := 0
-	for pos+4 <= len(data) {
-		keyLen := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
-		pos += 4
-		if pos+keyLen > len(data) {
-			break
-		}
-		key := data[pos : pos+keyLen]
-		pos += keyLen
-
-		if pos+4 > len(data) {
-			break
-		}
-		valLen := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
-		pos += 4
-		if pos+valLen > len(data) {
-			break
-		}
-		value := data[pos : pos+valLen]
-		pos += valLen
-
-		fn(key, value)
-	}
+	return uint64(C.ignis_engine_memtable_bytes(e.ptr))
 }
 
-// ============================================================
-// BloomFilter - Fast bloom filter backed by Rust
-// ============================================================
-
-// RustBloom is a high-performance bloom filter backed by Rust.
-type RustBloom struct {
-	ptr C.BloomPtr
+// SSTableCount returns the number of SSTables.
+func (e *Engine) SSTableCount() int {
+	if e.ptr == nil {
+		return 0
+	}
+	return int(C.ignis_engine_sstable_count(e.ptr))
 }
 
-// NewRustBloom creates a new Rust-backed bloom filter.
-func NewRustBloom(expectedItems int, fpRate float64) *RustBloom {
-	bf := &RustBloom{
-		ptr: C.ignis_bloom_new(C.size_t(expectedItems), C.double(fpRate)),
+// StatsWrites returns total write count.
+func (e *Engine) StatsWrites() uint64 {
+	if e.ptr == nil {
+		return 0
 	}
-	runtime.SetFinalizer(bf, func(bf *RustBloom) {
-		bf.Free()
-	})
-	return bf
+	return uint64(C.ignis_engine_stats_writes(e.ptr))
 }
 
-// Free releases the Rust-side memory.
-func (bf *RustBloom) Free() {
-	if bf.ptr != nil {
-		C.ignis_bloom_free(bf.ptr)
-		bf.ptr = nil
+// StatsReads returns total read count.
+func (e *Engine) StatsReads() uint64 {
+	if e.ptr == nil {
+		return 0
 	}
+	return uint64(C.ignis_engine_stats_reads(e.ptr))
 }
 
-// Add adds a key to the bloom filter.
-func (bf *RustBloom) Add(key []byte) {
-	if bf.ptr == nil {
-		return
+// StatsCacheHits returns cache hit count.
+func (e *Engine) StatsCacheHits() uint64 {
+	if e.ptr == nil {
+		return 0
 	}
-	var kp *C.uint8_t
-	if len(key) > 0 {
-		kp = (*C.uint8_t)(unsafe.Pointer(&key[0]))
-	}
-	C.ignis_bloom_add(bf.ptr, kp, C.size_t(len(key)))
+	return uint64(C.ignis_engine_stats_cache_hits(e.ptr))
 }
 
-// MightContain checks if a key might be in the set.
-func (bf *RustBloom) MightContain(key []byte) bool {
-	if bf.ptr == nil {
-		return true
+// StatsCacheMisses returns cache miss count.
+func (e *Engine) StatsCacheMisses() uint64 {
+	if e.ptr == nil {
+		return 0
 	}
-	var kp *C.uint8_t
-	if len(key) > 0 {
-		kp = (*C.uint8_t)(unsafe.Pointer(&key[0]))
-	}
-	return C.ignis_bloom_might_contain(bf.ptr, kp, C.size_t(len(key))) != 0
+	return uint64(C.ignis_engine_stats_cache_misses(e.ptr))
 }
