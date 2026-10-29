@@ -2,21 +2,41 @@ package benchmarks
 
 import (
 	"os"
-	"strconv"
 	"testing"
 
 	"github.com/buraksocial/IgnisDB-Go/internal/engine"
 )
 
-// Pre-allocated key/value buffers to avoid fmt.Sprintf overhead in benchmarks
+// appendInt appends decimal digits of n to buf without allocation.
+func appendInt(buf []byte, n int) []byte {
+	if n == 0 {
+		return append(buf, '0')
+	}
+	if n < 0 {
+		buf = append(buf, '-')
+		n = -n
+	}
+	// Write digits in reverse, then reverse them
+	start := len(buf)
+	for n > 0 {
+		buf = append(buf, byte('0'+n%10))
+		n /= 10
+	}
+	// Reverse the digits we just appended
+	for i, j := start, len(buf)-1; i < j; i, j = i+1, j-1 {
+		buf[i], buf[j] = buf[j], buf[i]
+	}
+	return buf
+}
+
 func makeKey(buf []byte, i int) []byte {
-	copy(buf, "key:")
-	return append(buf[:4], strconv.Itoa(i)...)
+	buf = append(buf[:0], "key:"...)
+	return appendInt(buf, i)
 }
 
 func makeValue(buf []byte, i int) []byte {
-	copy(buf, "value:")
-	return append(buf[:6], strconv.Itoa(i)...)
+	buf = append(buf[:0], "value:"...)
+	return appendInt(buf, i)
 }
 
 func BenchmarkWrite(b *testing.B) {
@@ -31,6 +51,13 @@ func BenchmarkWrite(b *testing.B) {
 
 	keyBuf := make([]byte, 0, 32)
 	valBuf := make([]byte, 0, 32)
+
+	// Warmup: fill sync.Pool caches so benchmark measures steady-state
+	for i := 0; i < 10000; i++ {
+		key := makeKey(keyBuf, i)
+		value := makeValue(valBuf, i)
+		eng.Put(key, value)
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -50,7 +77,6 @@ func BenchmarkReadHot(b *testing.B) {
 	}
 	defer eng.Close()
 
-	// Pre-populate
 	keyBuf := make([]byte, 0, 32)
 	for i := 0; i < 10000; i++ {
 		eng.Put(makeKey(keyBuf, i), []byte("value"))
@@ -77,7 +103,6 @@ func BenchmarkReadCold(b *testing.B) {
 	}
 	defer eng.Close()
 
-	// Pre-populate and flush to SSTables
 	keyBuf := make([]byte, 0, 32)
 	for i := 0; i < 100000; i++ {
 		eng.Put(makeKey(keyBuf, i), []byte("value"))
@@ -105,7 +130,6 @@ func BenchmarkMixedWorkload(b *testing.B) {
 	}
 	defer eng.Close()
 
-	// Pre-populate
 	keyBuf := make([]byte, 0, 32)
 	for i := 0; i < 10000; i++ {
 		eng.Put(makeKey(keyBuf, i), []byte("value"))

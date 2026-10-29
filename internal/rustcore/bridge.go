@@ -15,6 +15,7 @@ void ignis_sorted_map_put(SortedMapPtr ptr, const uint8_t* key, size_t key_len, 
 int32_t ignis_sorted_map_get(SortedMapPtr ptr, const uint8_t* key, size_t key_len, uint8_t** out_value, size_t* out_len);
 int32_t ignis_sorted_map_delete(SortedMapPtr ptr, const uint8_t* key, size_t key_len);
 size_t ignis_sorted_map_len(SortedMapPtr ptr);
+void ignis_sorted_map_iter_all(SortedMapPtr ptr, uint8_t** out_data, size_t* out_len);
 void ignis_free_bytes(uint8_t* ptr, size_t len);
 
 // BloomFilter
@@ -26,6 +27,7 @@ int32_t ignis_bloom_might_contain(BloomPtr ptr, const uint8_t* key, size_t key_l
 */
 import "C"
 import (
+	"encoding/binary"
 	"runtime"
 	"unsafe"
 )
@@ -112,6 +114,48 @@ func (sm *SortedMap) Len() int {
 		return 0
 	}
 	return int(C.ignis_sorted_map_len(sm.ptr))
+}
+
+// IterAllFunc calls fn for each key-value pair in sorted order.
+// This avoids allocating a Go slice for the entire dataset.
+func (sm *SortedMap) IterAllFunc(fn func(key, value []byte)) {
+	if sm.ptr == nil {
+		return
+	}
+	// Get flat buffer from Rust: [key_len(4)][key][value_len(4)][value]...
+	var outPtr *C.uint8_t
+	var outLen C.size_t
+	C.ignis_sorted_map_iter_all(sm.ptr, &outPtr, &outLen)
+	if outPtr == nil || outLen == 0 {
+		return
+	}
+	data := C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen))
+	C.ignis_free_bytes(outPtr, outLen)
+
+	// Parse flat buffer
+	pos := 0
+	for pos+4 <= len(data) {
+		keyLen := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
+		pos += 4
+		if pos+keyLen > len(data) {
+			break
+		}
+		key := data[pos : pos+keyLen]
+		pos += keyLen
+
+		if pos+4 > len(data) {
+			break
+		}
+		valLen := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
+		pos += 4
+		if pos+valLen > len(data) {
+			break
+		}
+		value := data[pos : pos+valLen]
+		pos += valLen
+
+		fn(key, value)
+	}
 }
 
 // ============================================================

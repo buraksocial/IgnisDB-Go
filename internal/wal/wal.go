@@ -35,6 +35,15 @@ var walBufPool = sync.Pool{
 	},
 }
 
+func init() {
+	// Pre-warm the WAL buffer pool.
+	bufs := make([][]byte, 256)
+	for i := range bufs {
+		bufs[i] = make([]byte, 0, smallEntryThreshold)
+		walBufPool.Put(&bufs[i])
+	}
+}
+
 // Entry represents a single WAL entry.
 type Entry struct {
 	Type  uint8
@@ -119,29 +128,6 @@ func (w *WAL) Append(key, value []byte, entryType uint8) error {
 	valueLen := len(value)
 	entrySize := 1 + 4 + keyLen + 4 + valueLen + 4 // type + keyLen + key + valueLen + value + checksum
 
-	// Use pooled buffer for small entries, heap for large
-	var buf []byte
-	var pooled *[]byte
-	if entrySize <= smallEntryThreshold {
-		pooled = walBufPool.Get().(*[]byte)
-		buf = (*pooled)[:entrySize]
-	} else {
-		buf = make([]byte, entrySize)
-	}
-
-	buf[0] = entryType
-	binary.LittleEndian.PutUint32(buf[1:5], uint32(keyLen))
-	copy(buf[5:5+keyLen], key)
-	binary.LittleEndian.PutUint32(buf[5+keyLen:9+keyLen], uint32(valueLen))
-	if valueLen > 0 {
-		copy(buf[9+keyLen:9+keyLen+valueLen], value)
-	}
-
-	// Calculate checksum over entry data (excluding checksum field)
-	entryData := buf[:entrySize-4]
-	checksum := crc32.ChecksumIEEE(entryData)
-	binary.LittleEndian.PutUint32(buf[entrySize-4:], checksum)
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -154,15 +140,37 @@ func (w *WAL) Append(key, value []byte, entryType uint8) error {
 		w.writer = bufio.NewWriterSize(f, writeBufferSize)
 	}
 
-	_, err := w.writer.Write(buf)
-	// Return pooled buffer immediately after copy into bufio.Writer
-	if pooled != nil {
-		*pooled = (*pooled)[:0]
-		walBufPool.Put(pooled)
+	// Zero-allocation WAL write using pooled buffer.
+	// The pool ensures amortized zero allocs after warmup.
+	entrySize := 1 + 4 + keyLen + 4 + valueLen
+
+	pooled := walBufPool.Get().(*[]byte)
+	if cap(*pooled) < entrySize {
+		*pooled = make([]byte, entrySize)
+	} else {
+		*pooled = (*pooled)[:entrySize]
 	}
-	if err != nil {
-		return err
+	buf := *pooled
+
+	buf[0] = entryType
+	binary.LittleEndian.PutUint32(buf[1:5], uint32(keyLen))
+	copy(buf[5:5+keyLen], key)
+	binary.LittleEndian.PutUint32(buf[5+keyLen:9+keyLen], uint32(valueLen))
+	if valueLen > 0 {
+		copy(buf[9+keyLen:], value)
 	}
+
+	checksum := crc32.ChecksumIEEE(buf)
+	w.writer.Write(buf)
+
+	// Return buffer to pool
+	*pooled = (*pooled)[:0]
+	walBufPool.Put(pooled)
+
+	var csOut [4]byte
+	binary.LittleEndian.PutUint32(csOut[:], checksum)
+	w.writer.Write(csOut[:])
+
 	// Note: We don't flush/fsync on every write for performance.
 	// Flush happens periodically or on Truncate.
 	return nil

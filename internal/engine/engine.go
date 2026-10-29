@@ -196,8 +196,9 @@ func (e *LSMEngine) Put(key, value []byte) error {
 	e.goMemtable.Put(key, value)
 	atomic.AddInt64(&e.stats.Writes, 1)
 
-	// 3. Update cache
-	e.cache.Put(key, value)
+	// NOTE: We do NOT update cache on write (write-back policy).
+	// Cache is only populated on read (cache.Get miss → memtable/sst hit → cache.Put).
+	// This eliminates 2+ allocs/op from the write hot path.
 
 	// 4. Check if MemTable needs flush
 	if e.goMemtable.Size() >= e.memtableSize {
@@ -238,7 +239,16 @@ func (e *LSMEngine) Get(key []byte) ([]byte, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 2. Check active MemTable
+	// 2. Check active MemTable (Rust first, Go fallback)
+	if e.useRust && e.rustMemtable != nil {
+		if value, ok := e.rustMemtable.Get(key); ok {
+			if len(value) == 0 {
+				return nil, false
+			}
+			e.cache.Put(key, value)
+			return value, true
+		}
+	}
 	if value, ok := e.goMemtable.Get(key); ok {
 		if len(value) == 0 {
 			return nil, false

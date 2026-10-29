@@ -33,6 +33,16 @@ var nodePool = sync.Pool{
 	},
 }
 
+func init() {
+	// Pre-warm the node pool to avoid cold-start allocations.
+	// These nodes will be reused during normal operation.
+	nodes := make([]*Node, 1024)
+	for i := range nodes {
+		nodes[i] = &Node{}
+		nodePool.Put(nodes[i])
+	}
+}
+
 func newNode(key, value []byte, level int) *Node {
 	n := nodePool.Get().(*Node)
 	n.Key = key

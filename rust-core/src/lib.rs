@@ -247,6 +247,35 @@ pub extern "C" fn ignis_sorted_map_len(ptr: *mut SortedMap) -> usize {
     map.len()
 }
 
+/// Returns all entries as flat buffer: [key_len(4)][key][value_len(4)][value]...
+/// Caller must free with ignis_free_bytes.
+#[no_mangle]
+pub extern "C" fn ignis_sorted_map_iter_all(
+    ptr: *mut SortedMap,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) {
+    if ptr.is_null() || out_data.is_null() || out_len.is_null() {
+        return;
+    }
+    let map = unsafe { &*ptr };
+    let buf = map.iter_all();
+    let len = buf.len();
+    if len == 0 {
+        unsafe {
+            *out_data = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return;
+    }
+    let ptr_out = libc_malloc(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr_out, len);
+        *out_data = ptr_out;
+        *out_len = len;
+    }
+}
+
 /// Free bytes allocated by Rust
 #[no_mangle]
 pub extern "C" fn ignis_free_bytes(ptr: *mut u8, len: usize) {
