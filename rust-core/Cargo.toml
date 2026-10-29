@@ -9,6 +9,7 @@ crate-type = ["staticlib"]
 [dependencies]
 memmap2 = "0.9"
 crc32fast = "1.4"
+dashmap = "6"
 
 [profile.release]
 opt-level = 3

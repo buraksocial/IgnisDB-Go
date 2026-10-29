@@ -9,9 +9,10 @@ package rustcore
 
 typedef void* EnginePtr;
 
-EnginePtr ignis_engine_open(const uint8_t* data_dir, size_t data_dir_len, uint64_t memtable_size_limit, size_t cache_size);
+EnginePtr ignis_engine_open(const uint8_t* data_dir, size_t data_dir_len, uint64_t memtable_size_limit, size_t cache_entries);
 int32_t ignis_engine_close(EnginePtr ptr);
 int32_t ignis_engine_put(EnginePtr ptr, const uint8_t* key, size_t key_len, const uint8_t* value, size_t value_len);
+int32_t ignis_engine_batch_put(EnginePtr ptr, const uint8_t** keys, const size_t* key_lens, const uint8_t** values, const size_t* value_lens, size_t count);
 int32_t ignis_engine_get(EnginePtr ptr, const uint8_t* key, size_t key_len, uint8_t** out_value, size_t* out_len);
 int32_t ignis_engine_delete(EnginePtr ptr, const uint8_t* key, size_t key_len);
 int32_t ignis_engine_flush(EnginePtr ptr);
