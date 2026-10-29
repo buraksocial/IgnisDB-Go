@@ -1,47 +1,57 @@
 # IgnisDB-Go
 
-High-performance LSM-Tree + Tiered Storage database engine written in Go.
-A 10x faster reimplementation of [IgnisDB](https://github.com/buraksocial/IgnisDB) (Python).
+🌐 **English** · [Türkçe](README_TR.md)
 
-## Features
+**High-performance LSM-Tree + Tiered Storage database**, written in Go.
+A **hybrid (Go + Rust)** implementation of Python [IgnisDB](https://github.com/buraksocial/IgnisDB) v2,
+with hot-path primitives ported to Rust.
 
-- **LSM-Tree Storage Engine**: MemTable (SkipList) → SSTable (mmap) with background compaction
-- **RESP Protocol Server**: Backward compatible with Redis/IgnisDB v1 clients
-- **Hot Cache**: Fixed-size LRU cache (64 MB default) for frequently accessed keys
-- **Bloom Filters**: Probabilistic set membership for fast negative lookups
-- **Write-Ahead Log**: Crash recovery with CRC32 checksums
-- **Sorted Sets**: Redis ZSET compatible secondary indexes
-- **Full-Text Search**: Inverted index with TF-IDF scoring
-- **Zero-Copy Reads**: Native mmap via syscall.Mmap
-- **Single Binary**: ~15-20 MB static binary, no runtime dependencies
+> **~40–150x faster than Python** on writes and reads, with **near-zero allocation** on every hot operation.
 
-## Architecture
+| Benchmark | Python v2 | IgnisDB-Go (Hybrid) | Speedup | Allocs/op |
+|-----------|-----------|---------------------|---------|-----------|
+| Write       |    48,543 ops/s | **~7.59M ops/s** | **156x** | 1 |
+| Read (hot)  |   125,786 ops/s | **~5.59M ops/s** |  **44x** | 1 |
+| Read (cold) |    28,409 ops/s | **~4.97M ops/s** | **175x** | 1 |
+| Mixed       |   108,696 ops/s | **~4.06M ops/s** |  **37x** | 1 |
 
-```
-┌─────────────────────────────────────┐
-│  Hot Cache (RAM) — 64 MB fixed     │
-│  ├── LRU cache (10K keys)          │
-│  ├── MemTable (SkipList, 16 MB)    │
-│  └── Bloom filters (8 MB)          │
-├─────────────────────────────────────┤
-│  Warm Cache (mmap) — OS managed    │
-│  └── SSTable files (memory-mapped) │
-├─────────────────────────────────────┤
-│  Cold Storage (Disk) — Unlimited   │
-│  ├── SSTables (sorted, compressed) │
-│  ├── WAL (crash recovery)          │
-│  └── Compaction output             │
-└─────────────────────────────────────┘
-```
+*(Measured on a 13th Gen Intel i5-13500H, `go test -benchmem`. Details → [docs/benchmarks.md](docs/benchmarks.md))*
 
-## Quick Start
+---
 
-### Build & Run
+## Highlights
+
+- **LSM-Tree engine** — MemTable (SkipList) → SSTable (mmap) + background flush/compaction
+- **Hybrid Go + Rust** — hot-path storage primitives (SortedMap, Bloom) in Rust, bound via CGo FFI
+- **Tiered Storage** — Hot cache (RAM/LRU) → Warm (OS-managed mmap) → Cold (disk)
+- **RESP protocol server** — **backward compatible** with Redis / IgnisDB v1 clients
+- **Write-Ahead Log** — crash recovery with CRC32 checksums
+- **Bloom filters** — skip disk access on negative lookups
+- **Sorted Sets (ZSET)** and **Full-Text Search** (TF-scored inverted index)
+- **Single binary** — static build, no runtime dependencies
+
+## Install & Build
+
+Requirements: **Go ≥ 1.21**, **Rust (stable) + cargo**, **CGO_ENABLED=1**, a C toolchain (gcc).
 
 ```bash
+# Build the Rust core and the server
 make build
+
+# Start the server
 ./bin/ignisdb-go --data-dir ./data --port 6380
+
+# Tests (with race detector)
+make test
+
+# Benchmarks
+make bench
 ```
+
+> ⚠️ Without the Rust `libignisdb_core.a`, the CGo link fails. `make build` compiles it
+> automatically; if you use raw `go build`, run `cd rust-core && cargo build --release` first.
+
+## Quick Start
 
 ### Connect with redis-cli
 
@@ -57,70 +67,106 @@ OK
 1) "alice"
 2) "charlie"
 3) "bob"
+127.0.0.1:6380> INFO
 ```
 
-### Embedded Usage
+### Use it embedded in Go
 
 ```go
-import "github.com/buraksocial/IgnisDB-Go/internal/engine"
+package main
 
-eng, _ := engine.Open(engine.Config{DataDir: "./data"})
-defer eng.Close()
+import (
+    "fmt"
 
-eng.Put([]byte("key"), []byte("value"))
-val, ok := eng.Get([]byte("key"))
+    "github.com/buraksocial/IgnisDB-Go/internal/engine"
+)
+
+func main() {
+    eng, err := engine.Open(engine.Config{DataDir: "./data"})
+    if err != nil {
+        panic(err)
+    }
+    defer eng.Close()
+
+    eng.Put([]byte("hello"), []byte("world"))
+    if val, ok := eng.Get([]byte("hello")); ok {
+        fmt.Printf("hello => %s\n", val) // hello => world
+    }
+}
 ```
 
-## Supported Commands
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/getting-started.md](docs/getting-started.md) | Install, prerequisites, first run, troubleshooting |
+| [docs/embedded-usage.md](docs/embedded-usage.md) | Go embedded API: engine, sorted set, search, client |
+| [docs/server-protocol.md](docs/server-protocol.md) | RESP server and **all supported commands** |
+| [docs/architecture.md](docs/architecture.md) | Hybrid Go+Rust architecture, LSM, tiered storage |
+| [docs/configuration.md](docs/configuration.md) | Config fields, CLI flags, environment variables |
+| [docs/api-reference.md](docs/api-reference.md) | Full Go API reference (type signatures) |
+| [docs/benchmarks.md](docs/benchmarks.md) | Performance methodology and measurements |
+| [docs/operations.md](docs/operations.md) | Production: flush, compaction, recovery, statistics |
+
+> Every doc is also available in Turkish with the `_TR.md` suffix
+> (e.g. [docs/getting-started_TR.md](docs/getting-started_TR.md)).
+
+## Supported Commands (summary)
 
 | Category | Commands |
 |----------|----------|
-| Strings | GET, SET, DEL, EXISTS, EXPIRE, TTL, PERSIST |
-| Lists | LPUSH, RPUSH, LRANGE, LLEN |
-| Hashes | HSET, HGET, HGETALL, HDEL |
-| Sets | SADD, SMEMBERS, SISMEMBER, SREM |
-| Sorted Sets | ZADD, ZREM, ZSCORE, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD |
-| Full-Text Search | FT.ADD, FT.SEARCH |
-| Utility | PING, INFO, AUTH, CACHE.STATS |
+| Strings  | `GET` `SET` `DEL` `EXISTS` `EXPIRE` `TTL` `PERSIST` |
+| Lists    | `LPUSH` `RPUSH` `LRANGE` `LLEN` |
+| Hashes   | `HSET` `HGET` `HGETALL` `HDEL` |
+| Sets     | `SADD` `SMEMBERS` `SISMEMBER` `SREM` |
+| Sorted Sets | `ZADD` `ZREM` `ZSCORE` `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZCARD` |
+| Full-Text | `FT.ADD` `FT.SEARCH` |
+| Utility  | `PING` `INFO` `AUTH` `CACHE.STATS` `MULTI` `EXEC` `DISCARD` `SUBSCRIBE` `PUBLISH` |
 
-## Performance Targets
-
-| Metric | Python v2 | Go Target |
-|--------|-----------|-----------|
-| Write | 50K ops/sec | 500K ops/sec |
-| Read (hot) | 200K ops/sec | 2M ops/sec |
-| Read (cold) | 50K ops/sec | 500K ops/sec |
-| RAM overhead | 64-88 MB | 32-48 MB |
-| Startup time | 500ms | 10ms |
-
-## Testing
-
-```bash
-make test    # Run all tests with race detector
-make bench   # Run benchmarks
-```
+Full syntax and examples → [docs/server-protocol.md](docs/server-protocol.md)
 
 ## Project Structure
 
 ```
 ignisdb-go/
-├── cmd/server/main.go           # Entry point
+├── cmd/server/            # Server entry point (main.go)
 ├── internal/
-│   ├── engine/engine.go         # LSM Engine
-│   ├── memtable/skiplist.go     # SkipList MemTable
-│   ├── sstable/sstable.go       # SSTable + mmap
-│   ├── wal/wal.go               # Write-Ahead Log
-│   ├── cache/lru.go             # LRU hot cache
-│   ├── bloom/bloom.go           # Bloom filter
-│   ├── sortedset/sortedset.go   # Sorted sets
-│   ├── search/inverted.go       # Full-text search
-│   └── server/resp.go           # RESP protocol server
-├── pkg/client/client.go         # Go client library
-├── benchmarks/                  # Performance benchmarks
-├── examples/                    # Usage examples
-└── tests/                       # Integration tests
+│   ├── engine/            # LSM engine (hybrid orchestration)
+│   ├── memtable/          # SkipList MemTable
+│   ├── sstable/           # SSTable + mmap + sparse index
+│   ├── wal/               # Write-Ahead Log (buffered, CRC32)
+│   ├── cache/             # LRU hot cache (write-back)
+│   ├── bloom/             # Bloom filter
+│   ├── sortedset/         # ZSET implementation
+│   ├── search/            # Full-text inverted index
+│   ├── rustcore/          # CGo FFI bridge (Rust static lib)
+│   └── server/            # RESP protocol server
+├── rust-core/             # Rust crate (BTreeMap SortedMap, fast Bloom)
+├── pkg/client/            # Go client library
+├── benchmarks/            # go test -bench performance suite
+├── examples/              # Usage examples
+└── tests/                 # Integration tests (7/7 pass)
 ```
+
+## Architecture (brief)
+
+```
+┌───────────────────────────────────────────────┐
+│  Go:  RESP Server · API · Orchestration       │  ← request routing, GC
+├───────────────────────────────────────────────┤
+│  CGo FFI Bridge (minimal boundary)            │  ← only hot primitives
+├───────────────────────────────────────────────┤
+│  Rust:  SortedMap (BTreeMap) · Fast Bloom     │  ← write path + negative lookup
+├───────────────────────────────────────────────┤
+│  Go:  MemTable · WAL · SSTable · LRU Cache    │  ← zero/near-zero alloc hot path
+└───────────────────────────────────────────────┘
+```
+
+Why this choice? A full-Rust core was tried, but the CGo boundary crossing on every
+operation (~1µs/op) noticeably slowed hot reads/writes. The hybrid approach keeps the
+hot path in Go (near-zero allocation) and borrows Rust only where it wins. Details →
+[docs/architecture.md](docs/architecture.md)
 
 ## License
 
-MIT
+[MIT](LICENSE)

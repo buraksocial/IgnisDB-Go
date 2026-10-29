@@ -1,21 +1,25 @@
-.PHONY: build test bench clean release run
+.PHONY: build build-rust test bench clean run release
 
-build:
-	go build -ldflags="-s -w" -o bin/ignisdb-go ./cmd/server
+# Build the Rust core static library (required for CGo linkage)
+build-rust:
+	cd rust-core && cargo build --release
 
-test:
-	go test -v -race ./...
+# Build the server binary (Rust core + Go)
+build: build-rust
+	CGO_ENABLED=1 go build -ldflags="-s -w" -o bin/ignisdb-go ./cmd/server
 
-bench:
-	go test -bench=. -benchmem ./benchmarks/
+test: build-rust
+	CGO_ENABLED=1 go test -v -race ./...
+
+bench: build-rust
+	CGO_ENABLED=1 go test -bench=. -benchmem ./benchmarks/
 
 clean:
 	rm -rf bin/ data/
+	cd rust-core && cargo clean
 
 run: build
 	./bin/ignisdb-go
 
-release:
-	GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/ignisdb-go-linux-amd64 ./cmd/server
-	GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o bin/ignisdb-go-darwin-arm64 ./cmd/server
-	GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o bin/ignisdb-go-windows-amd64.exe ./cmd/server
+release: build-rust
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/ignisdb-go-linux-amd64 ./cmd/server
