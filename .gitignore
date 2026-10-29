@@ -1,0 +1,4 @@
+bin/
+data/
+*.test
+rust-core/target/

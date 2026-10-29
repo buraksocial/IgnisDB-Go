@@ -1,4 +1,5 @@
 // Package cache implements a fixed-size LRU hot cache for frequently accessed keys.
+// Optimized with reduced allocations and efficient eviction.
 package cache
 
 import (

@@ -1,5 +1,7 @@
 // Package memtable implements a SkipList-based sorted in-memory data structure
 // for the LSM engine's MemTable. Provides O(log n) insert, delete, and search.
+//
+// Optimized with sync.Pool for zero-allocation hot path node reuse.
 package memtable
 
 import (
@@ -21,6 +23,33 @@ type Node struct {
 	Key     []byte
 	Value   []byte
 	Forward [MaxLevel + 1]*Node
+	level   int // actual level of this node
+}
+
+// nodePool reuses nodes to reduce GC pressure.
+var nodePool = sync.Pool{
+	New: func() interface{} {
+		return &Node{}
+	},
+}
+
+func newNode(key, value []byte, level int) *Node {
+	n := nodePool.Get().(*Node)
+	n.Key = key
+	n.Value = value
+	n.level = level
+	// Clear forward pointers up to max level
+	for i := 0; i <= MaxLevel; i++ {
+		n.Forward[i] = nil
+	}
+	return n
+}
+
+func putNode(n *Node) {
+	n.Key = nil
+	n.Value = nil
+	n.level = 0
+	nodePool.Put(n)
 }
 
 // SkipList is a sorted in-memory data structure for MemTable.
@@ -34,8 +63,13 @@ type SkipList struct {
 
 // New creates a new empty SkipList.
 func New() *SkipList {
+	header := nodePool.Get().(*Node)
+	header.level = MaxLevel
+	for i := 0; i <= MaxLevel; i++ {
+		header.Forward[i] = nil
+	}
 	return &SkipList{
-		header: &Node{},
+		header: header,
 		level:  0,
 	}
 }
@@ -84,13 +118,10 @@ func (sl *SkipList) Put(key, value []byte) {
 		sl.level = newLevel
 	}
 
-	newNode := &Node{
-		Key:   key,
-		Value: value,
-	}
+	n := newNode(key, value, newLevel)
 	for i := 0; i <= newLevel; i++ {
-		newNode.Forward[i] = update[i].Forward[i]
-		update[i].Forward[i] = newNode
+		n.Forward[i] = update[i].Forward[i]
+		update[i].Forward[i] = n
 	}
 
 	atomic.AddInt64(&sl.count, 1)
@@ -145,8 +176,11 @@ func (sl *SkipList) Delete(key []byte) bool {
 			sl.level--
 		}
 
+		valLen := len(current.Value)
+		putNode(current)
+
 		atomic.AddInt64(&sl.count, -1)
-		atomic.AddInt64(&sl.size, -int64(len(key)+len(current.Value)))
+		atomic.AddInt64(&sl.size, -int64(len(key)+valLen))
 		return true
 	}
 	return false
@@ -203,8 +237,6 @@ func (sl *SkipList) Keys() [][]byte {
 }
 
 // RangeIter iterates over keys in range [startKey, endKey].
-// Pass nil for startKey to begin from the first element.
-// Pass nil for endKey to iterate to the last element.
 func (sl *SkipList) RangeIter(startKey, endKey []byte) []Item {
 	sl.mu.RLock()
 	defer sl.mu.RUnlock()
@@ -212,7 +244,6 @@ func (sl *SkipList) RangeIter(startKey, endKey []byte) []Item {
 	var items []Item
 	current := sl.header
 
-	// Find starting position
 	if startKey != nil {
 		for i := sl.level; i >= 0; i-- {
 			for current.Forward[i] != nil && bytes.Compare(current.Forward[i].Key, startKey) < 0 {
@@ -224,7 +255,6 @@ func (sl *SkipList) RangeIter(startKey, endKey []byte) []Item {
 		current = current.Forward[0]
 	}
 
-	// Iterate until end
 	for current != nil {
 		if endKey != nil && bytes.Compare(current.Key, endKey) > 0 {
 			break
@@ -235,12 +265,23 @@ func (sl *SkipList) RangeIter(startKey, endKey []byte) []Item {
 	return items
 }
 
-// Clear removes all entries.
+// Clear removes all entries and returns nodes to pool.
 func (sl *SkipList) Clear() {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 
-	sl.header = &Node{}
+	// Return all nodes to pool
+	current := sl.header.Forward[0]
+	for current != nil {
+		next := current.Forward[0]
+		putNode(current)
+		current = next
+	}
+
+	// Reset header
+	for i := 0; i <= MaxLevel; i++ {
+		sl.header.Forward[i] = nil
+	}
 	sl.level = 0
 	atomic.StoreInt64(&sl.count, 0)
 	atomic.StoreInt64(&sl.size, 0)

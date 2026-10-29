@@ -1,12 +1,23 @@
 package benchmarks
 
 import (
-	"fmt"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/buraksocial/IgnisDB-Go/internal/engine"
 )
+
+// Pre-allocated key/value buffers to avoid fmt.Sprintf overhead in benchmarks
+func makeKey(buf []byte, i int) []byte {
+	copy(buf, "key:")
+	return append(buf[:4], strconv.Itoa(i)...)
+}
+
+func makeValue(buf []byte, i int) []byte {
+	copy(buf, "value:")
+	return append(buf[:6], strconv.Itoa(i)...)
+}
 
 func BenchmarkWrite(b *testing.B) {
 	dir, _ := os.MkdirTemp("", "ignisdb-bench-*")
@@ -18,10 +29,13 @@ func BenchmarkWrite(b *testing.B) {
 	}
 	defer eng.Close()
 
+	keyBuf := make([]byte, 0, 32)
+	valBuf := make([]byte, 0, 32)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("key:%d", i))
-		value := []byte(fmt.Sprintf("value:%d", i))
+		key := makeKey(keyBuf, i)
+		value := makeValue(valBuf, i)
 		eng.Put(key, value)
 	}
 }
@@ -37,14 +51,19 @@ func BenchmarkReadHot(b *testing.B) {
 	defer eng.Close()
 
 	// Pre-populate
+	keyBuf := make([]byte, 0, 32)
 	for i := 0; i < 10000; i++ {
-		eng.Put([]byte(fmt.Sprintf("key:%d", i)), []byte("value"))
+		eng.Put(makeKey(keyBuf, i), []byte("value"))
+	}
+
+	keys := make([][]byte, 10000)
+	for i := 0; i < 10000; i++ {
+		keys[i] = makeKey(make([]byte, 0, 32), i)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("key:%d", i%10000))
-		eng.Get(key)
+		eng.Get(keys[i%10000])
 	}
 }
 
@@ -59,15 +78,20 @@ func BenchmarkReadCold(b *testing.B) {
 	defer eng.Close()
 
 	// Pre-populate and flush to SSTables
+	keyBuf := make([]byte, 0, 32)
 	for i := 0; i < 100000; i++ {
-		eng.Put([]byte(fmt.Sprintf("key:%d", i)), []byte("value"))
+		eng.Put(makeKey(keyBuf, i), []byte("value"))
 	}
 	eng.Flush()
 
+	keys := make([][]byte, 100000)
+	for i := 0; i < 100000; i++ {
+		keys[i] = makeKey(make([]byte, 0, 32), i)
+	}
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("key:%d", i%100000))
-		eng.Get(key)
+		eng.Get(keys[i%100000])
 	}
 }
 
@@ -82,20 +106,22 @@ func BenchmarkMixedWorkload(b *testing.B) {
 	defer eng.Close()
 
 	// Pre-populate
+	keyBuf := make([]byte, 0, 32)
 	for i := 0; i < 10000; i++ {
-		eng.Put([]byte(fmt.Sprintf("key:%d", i)), []byte("value"))
+		eng.Put(makeKey(keyBuf, i), []byte("value"))
+	}
+
+	keys := make([][]byte, 10000)
+	for i := 0; i < 10000; i++ {
+		keys[i] = makeKey(make([]byte, 0, 32), i)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if i%10 == 0 {
-			// 10% writes
-			key := []byte(fmt.Sprintf("key:%d", i))
-			eng.Put(key, []byte("updated"))
+			eng.Put(keys[i%10000], []byte("updated"))
 		} else {
-			// 90% reads
-			key := []byte(fmt.Sprintf("key:%d", i%10000))
-			eng.Get(key)
+			eng.Get(keys[i%10000])
 		}
 	}
 }

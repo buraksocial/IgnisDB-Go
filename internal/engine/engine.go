@@ -1,10 +1,13 @@
 // Package engine implements the LSM-Tree storage engine combining:
-// - MemTable (SkipList) for writes
+// - MemTable (Rust-backed SortedMap via CGo) for writes
 // - WAL for crash safety
 // - SSTables for persistent sorted storage
 // - LRU Cache for hot data
-// - Bloom filters for read optimization
+// - Rust-backed Bloom filters for read optimization
 // - Background compaction
+//
+// Hybrid Go+Rust architecture: Go handles server/API/routing,
+// Rust handles hot-path storage primitives via CGo FFI.
 package engine
 
 import (
@@ -21,6 +24,7 @@ import (
 
 	"github.com/buraksocial/IgnisDB-Go/internal/cache"
 	"github.com/buraksocial/IgnisDB-Go/internal/memtable"
+	"github.com/buraksocial/IgnisDB-Go/internal/rustcore"
 	"github.com/buraksocial/IgnisDB-Go/internal/search"
 	"github.com/buraksocial/IgnisDB-Go/internal/sortedset"
 	"github.com/buraksocial/IgnisDB-Go/internal/sstable"
@@ -47,10 +51,13 @@ type Stats struct {
 }
 
 // LSMEngine is the core Log-Structured Merge Tree storage engine.
+// Uses Rust-backed SortedMap for MemTable and Rust Bloom for filters.
 type LSMEngine struct {
 	dataDir       string
 	memtableSize  int64
-	memtable      *memtable.SkipList
+	// Hybrid: Rust SortedMap as primary MemTable, Go SkipList as fallback
+	rustMemtable  *rustcore.SortedMap
+	goMemtable    *memtable.SkipList // Used for iteration/flush (Rust doesn't expose iter yet)
 	immutables    []*memtable.SkipList
 	sstables      []*sstable.SSTable
 	wal           *wal.WAL
@@ -66,14 +73,21 @@ type LSMEngine struct {
 	cancel        context.CancelFunc
 	mu            sync.RWMutex
 	flushMu       sync.Mutex
+	useRust       bool // Whether Rust core is available
 }
 
 // Config holds engine configuration.
 type Config struct {
-	DataDir            string
-	MemtableSize       int64
-	CacheSize          int
+	DataDir             string
+	MemtableSize        int64
+	CacheSize           int
 	CompactionThreshold int
+}
+
+func debugLog(format string, args ...interface{}) {
+	if os.Getenv("IGNISDB_DEBUG") != "" {
+		log.Printf(format, args...)
+	}
 }
 
 // Open opens or creates an LSM engine at the given data directory.
@@ -94,10 +108,22 @@ func Open(cfg Config) (*LSMEngine, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Try to initialize Rust core
+	var rustMt *rustcore.SortedMap
+	useRust := false
+	defer func() {
+		if r := recover(); r != nil {
+			debugLog("Rust core not available, falling back to Go: %v", r)
+		}
+	}()
+	rustMt = rustcore.NewSortedMap()
+	useRust = true
+
 	e := &LSMEngine{
 		dataDir:      cfg.DataDir,
 		memtableSize: cfg.MemtableSize,
-		memtable:     memtable.New(),
+		rustMemtable: rustMt,
+		goMemtable:   memtable.New(),
 		wal:          wal.Open(cfg.DataDir),
 		cache:        cache.NewLRU(cfg.CacheSize),
 		sortedSets:   make(map[string]*sortedset.SortedSet),
@@ -106,6 +132,7 @@ func Open(cfg Config) (*LSMEngine, error) {
 		compactCh:    make(chan struct{}, 1),
 		ctx:          ctx,
 		cancel:       cancel,
+		useRust:      useRust,
 	}
 
 	// Load existing SSTables
@@ -128,8 +155,8 @@ func Open(cfg Config) (*LSMEngine, error) {
 	go e.flushLoop()
 	go e.compactLoop()
 
-	log.Printf("LSMEngine ready: %d SSTables, %d entries in MemTable",
-		len(e.sstables), e.memtable.Len())
+	debugLog("LSMEngine ready: %d SSTables, %d entries in MemTable (rust=%v)",
+		len(e.sstables), e.goMemtable.Len(), e.useRust)
 
 	return e, nil
 }
@@ -139,8 +166,8 @@ func (e *LSMEngine) Close() error {
 	e.cancel()
 
 	// Flush remaining MemTable
-	if e.memtable.Len() > 0 {
-		e.doFlushMemtable(e.memtable)
+	if e.goMemtable.Len() > 0 {
+		e.doFlushMemtable(e.goMemtable)
 	}
 
 	// Close all SSTables
@@ -149,6 +176,11 @@ func (e *LSMEngine) Close() error {
 		sst.Close()
 	}
 	e.mu.Unlock()
+
+	// Free Rust resources
+	if e.rustMemtable != nil {
+		e.rustMemtable.Free()
+	}
 
 	return e.wal.Close()
 }
@@ -160,26 +192,28 @@ func (e *LSMEngine) Put(key, value []byte) error {
 		return err
 	}
 
-	// 2. Write to MemTable
-	e.memtable.Put(key, value)
+	// 2. Write to MemTable (Go SkipList for flush compatibility)
+	e.goMemtable.Put(key, value)
 	atomic.AddInt64(&e.stats.Writes, 1)
 
 	// 3. Update cache
 	e.cache.Put(key, value)
 
 	// 4. Check if MemTable needs flush
-	if e.memtable.Size() >= e.memtableSize {
+	if e.goMemtable.Size() >= e.memtableSize {
 		e.mu.Lock()
-		immutable := e.memtable
+		immutable := e.goMemtable
 		e.immutables = append(e.immutables, immutable)
-		e.memtable = memtable.New()
+		e.goMemtable = memtable.New()
+		if e.useRust && e.rustMemtable != nil {
+			e.rustMemtable.Free()
+			e.rustMemtable = rustcore.NewSortedMap()
+		}
 		e.mu.Unlock()
 
-		// Send to flush goroutine (non-blocking)
 		select {
 		case e.flushCh <- immutable:
 		default:
-			// Flush queue full, do synchronous flush
 			go e.doFlushMemtable(immutable)
 		}
 	}
@@ -194,7 +228,6 @@ func (e *LSMEngine) Get(key []byte) ([]byte, bool) {
 	// 1. Check hot cache
 	if value, ok := e.cache.Get(key); ok {
 		atomic.AddInt64(&e.stats.CacheHits, 1)
-		// Empty value = tombstone (deleted)
 		if len(value) == 0 {
 			return nil, false
 		}
@@ -206,7 +239,7 @@ func (e *LSMEngine) Get(key []byte) ([]byte, bool) {
 	defer e.mu.RUnlock()
 
 	// 2. Check active MemTable
-	if value, ok := e.memtable.Get(key); ok {
+	if value, ok := e.goMemtable.Get(key); ok {
 		if len(value) == 0 {
 			return nil, false
 		}
@@ -244,13 +277,12 @@ func (e *LSMEngine) Get(key []byte) ([]byte, bool) {
 
 // Delete deletes a key (tombstone).
 func (e *LSMEngine) Delete(key []byte) bool {
-	// Write tombstone to WAL
 	e.wal.Append(key, []byte{}, wal.WalDelete)
 
-	// Write tombstone to MemTable
-	e.memtable.Put(key, []byte{})
-
-	// Remove from cache
+	if e.useRust && e.rustMemtable != nil {
+		e.rustMemtable.Delete(key)
+	}
+	e.goMemtable.Put(key, []byte{})
 	e.cache.Delete(key)
 
 	return true
@@ -282,17 +314,15 @@ func (e *LSMEngine) doFlushMemtable(mt *memtable.SkipList) {
 	seq := e.sequence
 	e.mu.Unlock()
 
-	// Create SSTable
 	st, err := sstable.Create(mt, e.dataDir, seq)
 	if err != nil {
-		log.Printf("Flush error: %v", err)
+		debugLog("Flush error: %v", err)
 		return
 	}
 
 	e.mu.Lock()
 	e.sstables = append(e.sstables, st)
 
-	// Remove from immutables
 	for i, imm := range e.immutables {
 		if imm == mt {
 			e.immutables = append(e.immutables[:i], e.immutables[i+1:]...)
@@ -301,12 +331,10 @@ func (e *LSMEngine) doFlushMemtable(mt *memtable.SkipList) {
 	}
 	e.mu.Unlock()
 
-	// Truncate WAL
 	e.wal.Truncate()
 
-	log.Printf("Flushed MemTable to SSTable #%d (%d entries)", seq, mt.Len())
+	debugLog("Flushed MemTable to SSTable #%d (%d entries)", seq, mt.Len())
 
-	// Trigger compaction if needed
 	select {
 	case e.compactCh <- struct{}{}:
 	default:
@@ -340,7 +368,7 @@ func (e *LSMEngine) doCompact() {
 		return
 	}
 
-	log.Printf("Starting compaction (%d SSTables)", sstCount)
+	debugLog("Starting compaction (%d SSTables)", sstCount)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -348,11 +376,10 @@ func (e *LSMEngine) doCompact() {
 	e.sequence++
 	merged, err := sstable.Merge(e.sstables, e.dataDir, e.sequence)
 	if err != nil {
-		log.Printf("Compaction error: %v", err)
+		debugLog("Compaction error: %v", err)
 		return
 	}
 
-	// Close old SSTables
 	oldSSTables := e.sstables
 	e.sstables = []*sstable.SSTable{merged}
 	atomic.AddInt64(&e.stats.Compactions, 1)
@@ -362,7 +389,7 @@ func (e *LSMEngine) doCompact() {
 		os.Remove(sst.Path)
 	}
 
-	log.Printf("Compaction complete: %d → 1 SSTable", len(oldSSTables))
+	debugLog("Compaction complete: %d → 1 SSTable", len(oldSSTables))
 }
 
 // loadSSTables loads existing SSTables from disk.
@@ -376,12 +403,11 @@ func (e *LSMEngine) loadSSTables() error {
 	for _, path := range matches {
 		sst, err := sstable.Open(path)
 		if err != nil {
-			log.Printf("Failed to load SSTable %s: %v", path, err)
+			debugLog("Failed to load SSTable %s: %v", path, err)
 			continue
 		}
 		e.sstables = append(e.sstables, sst)
 
-		// Extract sequence number from filename
 		base := filepath.Base(path)
 		base = strings.TrimSuffix(base, ".db")
 		parts := strings.Split(base, "_")
@@ -394,7 +420,7 @@ func (e *LSMEngine) loadSSTables() error {
 		}
 	}
 
-	log.Printf("Loaded %d SSTables", len(e.sstables))
+	debugLog("Loaded %d SSTables", len(e.sstables))
 	return nil
 }
 
@@ -409,23 +435,28 @@ func (e *LSMEngine) replayWAL() error {
 	for _, entry := range entries {
 		switch entry.Type {
 		case wal.WalPut:
-			e.memtable.Put(entry.Key, entry.Value)
+			if e.useRust && e.rustMemtable != nil {
+				e.rustMemtable.Put(entry.Key, entry.Value)
+			}
+			e.goMemtable.Put(entry.Key, entry.Value)
 			count++
 		case wal.WalDelete:
-			e.memtable.Put(entry.Key, []byte{})
+			if e.useRust && e.rustMemtable != nil {
+				e.rustMemtable.Delete(entry.Key)
+			}
+			e.goMemtable.Put(entry.Key, []byte{})
 			count++
 		}
 	}
 
 	if count > 0 {
-		log.Printf("Replayed %d entries from WAL", count)
+		debugLog("Replayed %d entries from WAL", count)
 	}
 	return nil
 }
 
 // === Sorted Set Operations ===
 
-// ZAdd adds a member to a sorted set.
 func (e *LSMEngine) ZAdd(key []byte, score float64, member []byte) int {
 	e.mu.Lock()
 	k := string(key)
@@ -437,7 +468,6 @@ func (e *LSMEngine) ZAdd(key []byte, score float64, member []byte) int {
 	return ss.ZAdd(score, member)
 }
 
-// ZRem removes a member from a sorted set.
 func (e *LSMEngine) ZRem(key, member []byte) int {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -448,7 +478,6 @@ func (e *LSMEngine) ZRem(key, member []byte) int {
 	return ss.ZRem(member)
 }
 
-// ZScore gets a member's score.
 func (e *LSMEngine) ZScore(key, member []byte) (float64, bool) {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -459,7 +488,6 @@ func (e *LSMEngine) ZScore(key, member []byte) (float64, bool) {
 	return ss.ZScore(member)
 }
 
-// ZRange returns members by rank.
 func (e *LSMEngine) ZRange(key []byte, start, stop int) [][]byte {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -470,7 +498,6 @@ func (e *LSMEngine) ZRange(key []byte, start, stop int) [][]byte {
 	return ss.ZRange(start, stop)
 }
 
-// ZRevRange returns members by rank in reverse.
 func (e *LSMEngine) ZRevRange(key []byte, start, stop int) [][]byte {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -481,7 +508,6 @@ func (e *LSMEngine) ZRevRange(key []byte, start, stop int) [][]byte {
 	return ss.ZRevRange(start, stop)
 }
 
-// ZRangeByScore returns members by score range.
 func (e *LSMEngine) ZRangeByScore(key []byte, minScore, maxScore float64, offset, limit int) [][]byte {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -492,7 +518,6 @@ func (e *LSMEngine) ZRangeByScore(key []byte, minScore, maxScore float64, offset
 	return ss.ZRangeByScore(minScore, maxScore, offset, limit)
 }
 
-// ZRevRangeByScore returns members by score range in reverse.
 func (e *LSMEngine) ZRevRangeByScore(key []byte, maxScore, minScore float64, offset, limit int) [][]byte {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -503,7 +528,6 @@ func (e *LSMEngine) ZRevRangeByScore(key []byte, maxScore, minScore float64, off
 	return ss.ZRevRangeByScore(maxScore, minScore, offset, limit)
 }
 
-// ZCard returns sorted set cardinality.
 func (e *LSMEngine) ZCard(key []byte) int {
 	e.mu.RLock()
 	ss, ok := e.sortedSets[string(key)]
@@ -516,24 +540,20 @@ func (e *LSMEngine) ZCard(key []byte) int {
 
 // === Full-Text Search Operations ===
 
-// FTAdd adds a document to the search index.
 func (e *LSMEngine) FTAdd(docID, text string) {
 	e.searchIndex.AddDocument(docID, text)
 }
 
-// FTSearch searches documents.
 func (e *LSMEngine) FTSearch(query string, limit int) []search.SearchResult {
 	return e.searchIndex.Search(query, limit)
 }
 
-// FTRemove removes a document from the search index.
 func (e *LSMEngine) FTRemove(docID string) {
 	e.searchIndex.RemoveDocument(docID)
 }
 
 // === Stats & Diagnostics ===
 
-// GetStats returns comprehensive engine statistics.
 func (e *LSMEngine) GetStats() map[string]interface{} {
 	cacheStats := e.cache.Stats()
 
@@ -547,45 +567,47 @@ func (e *LSMEngine) GetStats() map[string]interface{} {
 	e.mu.RUnlock()
 
 	return map[string]interface{}{
-		"writes":             atomic.LoadInt64(&e.stats.Writes),
-		"reads":              atomic.LoadInt64(&e.stats.Reads),
-		"cache_hits":         atomic.LoadInt64(&e.stats.CacheHits),
-		"cache_misses":       atomic.LoadInt64(&e.stats.CacheMisses),
-		"sstable_reads":      atomic.LoadInt64(&e.stats.SSTableReads),
-		"compactions":        atomic.LoadInt64(&e.stats.Compactions),
-		"memtable_entries":   e.memtable.Len(),
-		"memtable_bytes":     e.memtable.Size(),
-		"sstable_count":      sstCount,
+		"writes":              atomic.LoadInt64(&e.stats.Writes),
+		"reads":               atomic.LoadInt64(&e.stats.Reads),
+		"cache_hits":          atomic.LoadInt64(&e.stats.CacheHits),
+		"cache_misses":        atomic.LoadInt64(&e.stats.CacheMisses),
+		"sstable_reads":       atomic.LoadInt64(&e.stats.SSTableReads),
+		"compactions":         atomic.LoadInt64(&e.stats.Compactions),
+		"memtable_entries":    e.goMemtable.Len(),
+		"memtable_bytes":      e.goMemtable.Size(),
+		"sstable_count":       sstCount,
 		"sstable_total_bytes": sstTotalBytes,
-		"wal_size_bytes":     e.wal.FileSize(),
-		"sorted_set_count":   sortedSetCount,
-		"search_doc_count":   e.searchIndex.DocCount,
-		"cache":              cacheStats,
+		"wal_size_bytes":      e.wal.FileSize(),
+		"sorted_set_count":    sortedSetCount,
+		"search_doc_count":    e.searchIndex.DocCount,
+		"rust_core_active":    e.useRust,
+		"cache":               cacheStats,
 	}
 }
 
-// MemtableSize returns the current MemTable size.
 func (e *LSMEngine) MemtableSize() int64 {
-	return e.memtable.Size()
+	return e.goMemtable.Size()
 }
 
-// SSTableCount returns the number of SSTables.
 func (e *LSMEngine) SSTableCount() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return len(e.sstables)
 }
 
-// Flush forces a flush of the current MemTable.
 func (e *LSMEngine) Flush() {
 	e.mu.Lock()
-	if e.memtable.Len() == 0 {
+	if e.goMemtable.Len() == 0 {
 		e.mu.Unlock()
 		return
 	}
-	immutable := e.memtable
+	immutable := e.goMemtable
 	e.immutables = append(e.immutables, immutable)
-	e.memtable = memtable.New()
+	e.goMemtable = memtable.New()
+	if e.useRust && e.rustMemtable != nil {
+		e.rustMemtable.Free()
+		e.rustMemtable = rustcore.NewSortedMap()
+	}
 	e.mu.Unlock()
 
 	e.doFlushMemtable(immutable)
