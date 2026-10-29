@@ -36,14 +36,30 @@ func main() {
 		fmt.Println("version deleted successfully")
 	}
 
-	// Note: Sorted Sets and Full-Text Search are now handled by the RESP server layer,
-	// not the embedded engine. Use the Redis-compatible server for ZADD/ZRANGE/FT.ADD/FT.SEARCH.
+	// Sorted Sets
+	eng.ZAdd([]byte("leaderboard"), 100, []byte("alice"))
+	eng.ZAdd([]byte("leaderboard"), 200, []byte("bob"))
+	eng.ZAdd([]byte("leaderboard"), 150, []byte("charlie"))
+
+	members := eng.ZRange([]byte("leaderboard"), 0, -1)
+	fmt.Println("Leaderboard:")
+	for _, m := range members {
+		score, _ := eng.ZScore([]byte("leaderboard"), m)
+		fmt.Printf("  %s: %.0f\n", m, score)
+	}
+
+	// Full-Text Search
+	eng.FTAdd("doc1", "Go is a fast compiled language")
+	eng.FTAdd("doc2", "Python is great for data science")
+	eng.FTAdd("doc3", "Go databases are very performant")
+
+	results := eng.FTSearch("go language", 10)
+	fmt.Println("\nSearch results for 'go language':")
+	for _, r := range results {
+		fmt.Printf("  %s (score: %.4f)\n", r.DocID, r.Score)
+	}
 
 	// Stats
 	stats := eng.GetStats()
 	fmt.Printf("\nStats: %+v\n", stats)
-
-	// Flush
-	eng.Flush()
-	fmt.Printf("After flush - SSTables: %d\n", eng.SSTableCount())
 }

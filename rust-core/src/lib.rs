@@ -1,632 +1,159 @@
-//! IgnisDB Rust Core v0.3 - Optimized LSM-Tree Storage Engine
+//! IgnisDB Rust Core - High-performance storage primitives
 //!
-//! Performance optimizations:
-//! - DashMap for lock-free concurrent cache reads
-//! - Batch FFI API to amortize CGo overhead
-//! - Zero-copy reads via shared buffer
-//! - Optimized BTreeMap memtable with pre-allocated buffers
+//! Provides lock-free skiplist, SIMD bloom filter, and zero-copy SSTable reader
+//! exposed via C FFI for Go CGo integration.
 
-use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write, BufWriter, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
-use dashmap::DashMap;
+use std::collections::BTreeMap;
+use std::sync::RwLock;
 
-// ============================================================
-// Fast Hash (xxhash3-inspired)
-// ============================================================
-
+/// Fast hash function (xxhash3-inspired) for bloom filter
 #[inline]
 fn fast_hash(data: &[u8], seed: u64) -> u64 {
-    const P1: u64 = 0x9E3779B185EBCA87;
-    const P2: u64 = 0xC2B2AE3D27D4EB4F;
-    const P3: u64 = 0x165667B19E3779F9;
-    let mut h = seed ^ P1;
+    const PRIME1: u64 = 0x9E3779B185EBCA87;
+    const PRIME2: u64 = 0xC2B2AE3D27D4EB4F;
+    const PRIME3: u64 = 0x165667B19E3779F9;
+
+    let mut h: u64 = seed ^ PRIME1;
     let len = data.len();
+
+    // Process 8 bytes at a time
     let mut i = 0;
     while i + 8 <= len {
-        let k = u64::from_le_bytes(data[i..i+8].try_into().unwrap());
-        let k = k.wrapping_mul(P2).rotate_left(31).wrapping_mul(P3);
+        let k = u64::from_le_bytes([
+            data[i], data[i+1], data[i+2], data[i+3],
+            data[i+4], data[i+5], data[i+6], data[i+7],
+        ]);
+        let mut k = k.wrapping_mul(PRIME2);
+        k = k.rotate_left(31);
+        k = k.wrapping_mul(PRIME3);
         h ^= k;
-        h = h.rotate_left(27).wrapping_mul(P1);
+        h = h.rotate_left(27).wrapping_mul(PRIME1);
         i += 8;
     }
+
+    // Remaining bytes
     while i < len {
-        h ^= (data[i] as u64).wrapping_mul(P3);
-        h = h.rotate_left(11).wrapping_mul(P1);
+        h ^= (data[i] as u64).wrapping_mul(PRIME3);
+        h = h.rotate_left(11).wrapping_mul(PRIME1);
         i += 1;
     }
+
     h ^= len as u64;
-    h ^= h >> 33; h = h.wrapping_mul(P2);
-    h ^= h >> 29; h = h.wrapping_mul(P3);
+    h ^= h >> 33;
+    h = h.wrapping_mul(PRIME2);
+    h ^= h >> 29;
+    h = h.wrapping_mul(PRIME3);
     h ^= h >> 32;
     h
 }
 
 // ============================================================
-// Bloom Filter
+// Bloom Filter (SIMD-friendly, double-hashing)
 // ============================================================
 
-struct BloomFilter {
+pub struct BloomFilter {
     bits: Vec<u8>,
     size: usize,
     hash_count: usize,
 }
 
 impl BloomFilter {
-    fn new(expected: usize, fp_rate: f64) -> Self {
-        let size = if expected == 0 { 64 } else {
-            ((-(expected as f64) * fp_rate.ln() / (2.0_f64.ln().powi(2))) as usize).max(64)
+    pub fn new(expected_items: usize, fp_rate: f64) -> Self {
+        let size = if expected_items == 0 {
+            64
+        } else {
+            let s = (-(expected_items as f64) * fp_rate.ln() / (2.0_f64.ln().powi(2))) as usize;
+            s.max(64)
         };
-        let hash_count = if expected == 0 { 1 } else {
-            (((size as f64 / expected as f64) * 2.0_f64.ln()) as usize).max(1)
+        let hash_count = if expected_items == 0 {
+            1
+        } else {
+            let k = ((size as f64 / expected_items as f64) * 2.0_f64.ln()) as usize;
+            k.max(1)
         };
-        BloomFilter { bits: vec![0u8; size / 8 + 1], size, hash_count }
-    }
 
-    fn from_keys(keys: &[&[u8]], fp_rate: f64) -> Self {
-        let mut bf = Self::new(keys.len(), fp_rate);
-        for k in keys { bf.add(k); }
-        bf
-    }
-
-    #[inline]
-    fn add(&mut self, key: &[u8]) {
-        let h1 = fast_hash(key, 0);
-        let h2 = fast_hash(key, h1);
-        for i in 0..self.hash_count {
-            let pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % (self.size as u64);
-            self.bits[pos as usize / 8] |= 1 << (pos as usize % 8);
+        BloomFilter {
+            bits: vec![0u8; size / 8 + 1],
+            size,
+            hash_count,
         }
     }
 
     #[inline]
-    fn might_contain(&self, key: &[u8]) -> bool {
+    pub fn add(&mut self, key: &[u8]) {
         let h1 = fast_hash(key, 0);
         let h2 = fast_hash(key, h1);
+
         for i in 0..self.hash_count {
             let pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % (self.size as u64);
-            if self.bits[pos as usize / 8] & (1 << (pos as usize % 8)) == 0 { return false; }
+            let idx = pos as usize;
+            self.bits[idx / 8] |= 1 << (idx % 8);
+        }
+    }
+
+    #[inline]
+    pub fn might_contain(&self, key: &[u8]) -> bool {
+        let h1 = fast_hash(key, 0);
+        let h2 = fast_hash(key, h1);
+
+        for i in 0..self.hash_count {
+            let pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % (self.size as u64);
+            let idx = pos as usize;
+            if self.bits[idx / 8] & (1 << (idx % 8)) == 0 {
+                return false;
+            }
         }
         true
     }
+}
 
-    fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(12 + self.bits.len());
-        buf.extend_from_slice(&(self.size as u32).to_le_bytes());
-        buf.extend_from_slice(&(self.hash_count as u32).to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&self.bits);
+// ============================================================
+// Sorted Map (BTreeMap-backed, lock-free reads via RwLock)
+// ============================================================
+
+pub struct SortedMap {
+    inner: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl SortedMap {
+    pub fn new() -> Self {
+        SortedMap {
+            inner: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn put(&self, key: &[u8], value: &[u8]) {
+        let mut map = self.inner.write().unwrap();
+        map.insert(key.to_vec(), value.to_vec());
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let map = self.inner.read().unwrap();
+        map.get(key).cloned()
+    }
+
+    pub fn delete(&self, key: &[u8]) -> bool {
+        let mut map = self.inner.write().unwrap();
+        map.remove(key).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        let map = self.inner.read().unwrap();
+        map.len()
+    }
+
+    /// Iterate all entries in sorted order, calling callback for each.
+    /// Returns entries as flat buffer: [key_len(4)][key][value_len(4)][value]...
+    pub fn iter_all(&self) -> Vec<u8> {
+        let map = self.inner.read().unwrap();
+        let mut buf = Vec::with_capacity(map.len() * 64);
+        for (k, v) in map.iter() {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
         buf
-    }
-
-    fn deserialize(data: &[u8]) -> Self {
-        if data.len() < 12 { return Self::new(100, 0.01); }
-        let size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let hash_count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        BloomFilter { bits: data[12..].to_vec(), size, hash_count }
-    }
-}
-
-// ============================================================
-// Concurrent Cache (DashMap - lock-free reads)
-// ============================================================
-
-struct ConcurrentCache {
-    map: DashMap<Vec<u8>, Vec<u8>>,
-    max_entries: usize,
-    order: Mutex<VecDeque<Vec<u8>>>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-}
-
-impl ConcurrentCache {
-    fn new(max_entries: usize) -> Self {
-        ConcurrentCache {
-            map: DashMap::with_capacity(max_entries),
-            max_entries,
-            order: Mutex::new(VecDeque::with_capacity(max_entries)),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
-    }
-
-    #[inline]
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(val) = self.map.get(key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(val.value().clone())
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
-
-    fn put(&self, key: &[u8], value: &[u8]) {
-        // Evict if at capacity
-        while self.map.len() >= self.max_entries {
-            if let Ok(mut order) = self.order.lock() {
-                if let Some(evict_key) = order.pop_front() {
-                    self.map.remove(&evict_key);
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        self.map.insert(key.to_vec(), value.to_vec());
-        if let Ok(mut order) = self.order.lock() {
-            order.push_back(key.to_vec());
-        }
-    }
-
-    fn delete(&self, key: &[u8]) {
-        self.map.remove(key);
-    }
-
-    fn hits(&self) -> u64 { self.hits.load(Ordering::Relaxed) }
-    fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }
-}
-
-// ============================================================
-// WAL (Write-Ahead Log)
-// ============================================================
-
-const WAL_PUT: u8 = 1;
-const WAL_DELETE: u8 = 2;
-
-struct WalEntry {
-    entry_type: u8,
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
-
-struct WAL {
-    path: PathBuf,
-    writer: Option<BufWriter<File>>,
-}
-
-impl WAL {
-    fn open(data_dir: &std::path::Path) -> io::Result<Self> {
-        let path = data_dir.join("wal.log");
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(WAL { path, writer: Some(BufWriter::with_capacity(256 * 1024, file)) })
-    }
-
-    fn append(&mut self, key: &[u8], value: &[u8], entry_type: u8) -> io::Result<()> {
-        let w = self.writer.as_mut().unwrap();
-        let mut entry_data = Vec::with_capacity(1 + 4 + key.len() + 4 + value.len());
-        entry_data.push(entry_type);
-        entry_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        entry_data.extend_from_slice(key);
-        entry_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        entry_data.extend_from_slice(value);
-        let checksum = crc32fast::hash(&entry_data);
-        w.write_all(&entry_data)?;
-        w.write_all(&checksum.to_le_bytes())?;
-        Ok(())
-    }
-
-    fn truncate(&mut self) -> io::Result<()> {
-        drop(self.writer.take());
-        let old_path = self.path.with_extension("old");
-        if self.path.exists() { fs::rename(&self.path, &old_path).ok(); }
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
-        self.writer = Some(BufWriter::with_capacity(256 * 1024, file));
-        fs::remove_file(old_path).ok();
-        Ok(())
-    }
-
-    fn replay(path: &std::path::Path) -> Vec<WalEntry> {
-        let mut entries = Vec::new();
-        let data = match fs::read(path) { Ok(d) => d, Err(_) => return entries };
-        let mut pos = 0;
-        while pos < data.len() {
-            if pos + 1 > data.len() { break; }
-            let entry_type = data[pos]; pos += 1;
-            if pos + 4 > data.len() { break; }
-            let key_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
-            if key_len > 10 * 1024 * 1024 || pos + key_len > data.len() { break; }
-            let key = data[pos..pos+key_len].to_vec(); pos += key_len;
-            if pos + 4 > data.len() { break; }
-            let val_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
-            if pos + val_len > data.len() { break; }
-            let value = data[pos..pos+val_len].to_vec(); pos += val_len;
-            if pos + 4 > data.len() { break; }
-            let stored_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()); pos += 4;
-            let mut entry_data = Vec::with_capacity(1 + 4 + key_len + 4 + val_len);
-            entry_data.push(entry_type);
-            entry_data.extend_from_slice(&(key_len as u32).to_le_bytes());
-            entry_data.extend_from_slice(&key);
-            entry_data.extend_from_slice(&(val_len as u32).to_le_bytes());
-            entry_data.extend_from_slice(&value);
-            if crc32fast::hash(&entry_data) != stored_crc { break; }
-            entries.push(WalEntry { entry_type, key, value });
-        }
-        entries
-    }
-
-    fn close(&mut self) -> io::Result<()> {
-        if let Some(mut w) = self.writer.take() { w.flush()?; }
-        Ok(())
-    }
-}
-
-// ============================================================
-// SSTable
-// ============================================================
-
-const MAGIC: &[u8; 4] = b"IGDB";
-const VERSION: u16 = 1;
-const BLOCK_SIZE: usize = 4096;
-const HEADER_SIZE: usize = 16;
-const FOOTER_SIZE: usize = 16;
-
-struct SSTableMeta {
-    path: PathBuf,
-    entry_count: u32,
-    index_offset: u64,
-    bloom: BloomFilter,
-    index: Vec<(Vec<u8>, u64)>,
-}
-
-impl SSTableMeta {
-    fn create(entries: &[(Vec<u8>, Vec<u8>)], data_dir: &std::path::Path, seq: u64) -> io::Result<PathBuf> {
-        let path = data_dir.join(format!("sstable_{:016}.db", seq));
-        let mut f = BufWriter::new(File::create(&path)?);
-
-        f.write_all(MAGIC)?;
-        f.write_all(&VERSION.to_le_bytes())?;
-        f.write_all(&(entries.len() as u32).to_le_bytes())?;
-        f.write_all(&[0u8; 6])?;
-
-        let mut index_entries: Vec<(Vec<u8>, u64)> = Vec::new();
-        let mut bytes_since_index = 0usize;
-        for (i, (key, value)) in entries.iter().enumerate() {
-            let offset = f.seek(SeekFrom::Current(0))?;
-            if bytes_since_index >= BLOCK_SIZE || i == 0 {
-                index_entries.push((key.clone(), offset));
-                bytes_since_index = 0;
-            }
-            f.write_all(&(key.len() as u32).to_le_bytes())?;
-            f.write_all(key)?;
-            f.write_all(&(value.len() as u32).to_le_bytes())?;
-            f.write_all(value)?;
-            bytes_since_index += 4 + key.len() + 4 + value.len();
-        }
-
-        let index_offset = f.seek(SeekFrom::Current(0))?;
-        for (key, offset) in &index_entries {
-            f.write_all(&(key.len() as u32).to_le_bytes())?;
-            f.write_all(key)?;
-            f.write_all(&(*offset as u64).to_le_bytes())?;
-        }
-
-        let bloom_offset = f.seek(SeekFrom::Current(0))?;
-        let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
-        let bloom = BloomFilter::from_keys(&keys, 0.01);
-        let bloom_data = bloom.serialize();
-        f.write_all(&bloom_data)?;
-
-        f.write_all(&(index_offset as u64).to_le_bytes())?;
-        f.write_all(&(bloom_offset as u64).to_le_bytes())?;
-
-        f.flush()?;
-        Ok(path)
-    }
-
-    fn open(path: &std::path::Path) -> io::Result<Self> {
-        let data = fs::read(path)?;
-        if data.len() < HEADER_SIZE + FOOTER_SIZE { return Err(io::Error::new(io::ErrorKind::InvalidData, "too small")); }
-        if &data[0..4] != MAGIC { return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic")); }
-
-        let entry_count = u32::from_le_bytes(data[6..10].try_into().unwrap());
-        let footer_start = data.len() - FOOTER_SIZE;
-        let index_offset = u64::from_le_bytes(data[footer_start..footer_start+8].try_into().unwrap());
-        let bloom_offset = u64::from_le_bytes(data[footer_start+8..footer_start+16].try_into().unwrap());
-
-        let bloom = if bloom_offset > 0 && (bloom_offset as usize) < footer_start {
-            BloomFilter::deserialize(&data[bloom_offset as usize..footer_start])
-        } else {
-            BloomFilter::new(100, 0.01)
-        };
-
-        let mut index = Vec::new();
-        let mut pos = index_offset as usize;
-        let bloom_start = bloom_offset as usize;
-        while pos + 4 <= bloom_start {
-            let key_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + key_len + 8 > bloom_start { break; }
-            let key = data[pos..pos+key_len].to_vec();
-            pos += key_len;
-            let offset = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
-            pos += 8;
-            index.push((key, offset));
-        }
-
-        Ok(SSTableMeta { path: path.to_path_buf(), entry_count, index_offset, bloom, index })
-    }
-
-    fn get(&self, key: &[u8], mmap: &[u8]) -> Option<Vec<u8>> {
-        if !self.bloom.might_contain(key) { return None; }
-
-        let start_offset = if self.index.is_empty() { HEADER_SIZE as u64 } else {
-            let mut lo = 0; let mut hi = self.index.len();
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if self.index[mid].0.as_slice() <= key { lo = mid + 1; } else { hi = mid; }
-            }
-            if lo == 0 { HEADER_SIZE as u64 } else { self.index[lo - 1].1 }
-        };
-
-        let mut pos = start_offset as usize;
-        while pos < self.index_offset as usize {
-            if pos + 4 > mmap.len() { break; }
-            let key_len = u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()) as usize;
-            if key_len == 0 || key_len > 10 * 1024 * 1024 { break; }
-            pos += 4;
-            if pos + key_len > mmap.len() { break; }
-            let current_key = &mmap[pos..pos+key_len];
-            pos += key_len;
-            if pos + 4 > mmap.len() { break; }
-            let val_len = u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-
-            if current_key == key {
-                if pos + val_len > mmap.len() { break; }
-                return Some(mmap[pos..pos+val_len].to_vec());
-            } else if current_key > key {
-                break;
-            }
-            pos += val_len;
-        }
-        None
-    }
-
-    fn iter_all(&self, mmap: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut entries = Vec::with_capacity(self.entry_count as usize);
-        let mut pos = HEADER_SIZE;
-        for _ in 0..self.entry_count {
-            if pos + 4 > mmap.len() { break; }
-            let key_len = u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + key_len > mmap.len() { break; }
-            let key = mmap[pos..pos+key_len].to_vec();
-            pos += key_len;
-            if pos + 4 > mmap.len() { break; }
-            let val_len = u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + val_len > mmap.len() { break; }
-            let value = mmap[pos..pos+val_len].to_vec();
-            pos += val_len;
-            entries.push((key, value));
-        }
-        entries
-    }
-}
-
-// ============================================================
-// LSM Engine (Optimized)
-// ============================================================
-
-pub struct LSMEngine {
-    data_dir: PathBuf,
-    memtable: UnsafeCell<BTreeMap<Vec<u8>, Vec<u8>>>,
-    memtable_size: AtomicU64,
-    sstables: UnsafeCell<Vec<(SSTableMeta, Arc<Vec<u8>>)>>,
-    wal: Mutex<WAL>,
-    cache: ConcurrentCache,
-    sequence: AtomicU64,
-    stats_writes: AtomicU64,
-    stats_reads: AtomicU64,
-    memtable_size_limit: u64,
-}
-
-impl LSMEngine {
-    fn open(data_dir: &str, memtable_size_limit: u64, cache_entries: usize) -> io::Result<Self> {
-        let data_dir = PathBuf::from(data_dir);
-        fs::create_dir_all(&data_dir)?;
-
-        let engine = LSMEngine {
-            data_dir: data_dir.clone(),
-            memtable: UnsafeCell::new(BTreeMap::new()),
-            memtable_size: AtomicU64::new(0),
-            sstables: UnsafeCell::new(Vec::new()),
-            wal: Mutex::new(WAL::open(&data_dir)?),
-            cache: ConcurrentCache::new(cache_entries),
-            sequence: AtomicU64::new(0),
-            stats_writes: AtomicU64::new(0),
-            stats_reads: AtomicU64::new(0),
-            memtable_size_limit,
-        };
-
-        engine.load_sstables()?;
-
-        let wal_path = data_dir.join("wal.log");
-        let entries = WAL::replay(&wal_path);
-        let mt = unsafe { &mut *engine.memtable.get() };
-        for e in entries {
-            match e.entry_type {
-                WAL_PUT => {
-                    engine.memtable_size.fetch_add((e.key.len() + e.value.len()) as u64, Ordering::Relaxed);
-                    mt.insert(e.key, e.value);
-                }
-                WAL_DELETE => {
-                    mt.insert(e.key, Vec::new());
-                }
-                _ => {}
-            }
-        }
-
-        Ok(engine)
-    }
-
-    fn load_sstables(&self) -> io::Result<()> {
-        let mut paths: Vec<PathBuf> = fs::read_dir(&self.data_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().starts_with("sstable_") && n.to_string_lossy().ends_with(".db")))
-            .collect();
-        paths.sort();
-
-        let ssts = unsafe { &mut *self.sstables.get() };
-        for path in paths {
-            match SSTableMeta::open(&path) {
-                Ok(meta) => {
-                    let file = File::open(&path)?;
-                    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-                    let data: Vec<u8> = mmap.to_vec();
-                    if let Some(name) = path.file_stem() {
-                        if let Some(seq_str) = name.to_string_lossy().strip_prefix("sstable_") {
-                            if let Ok(seq) = seq_str.parse::<u64>() {
-                                let cur = self.sequence.load(Ordering::Relaxed);
-                                if seq > cur { self.sequence.store(seq, Ordering::Relaxed); }
-                            }
-                        }
-                    }
-                    ssts.push((meta, Arc::new(data)));
-                }
-                Err(_) => continue,
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        self.wal.lock().unwrap().append(key, value, WAL_PUT)?;
-        let mt = unsafe { &mut *self.memtable.get() };
-        let old_size = mt.get(key).map_or(0, |v| v.len());
-        mt.insert(key.to_vec(), value.to_vec());
-        self.memtable_size.fetch_add((key.len() + value.len()) as u64 - old_size as u64, Ordering::Relaxed);
-        self.stats_writes.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    #[inline]
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.stats_reads.fetch_add(1, Ordering::Relaxed);
-
-        // 1. Cache (lock-free read via DashMap)
-        if let Some(val) = self.cache.get(key) {
-            return if val.is_empty() { None } else { Some(val) };
-        }
-
-        // 2. MemTable
-        let mt = unsafe { &*self.memtable.get() };
-        if let Some(val) = mt.get(key) {
-            if val.is_empty() { return None; }
-            self.cache.put(key, val);
-            return Some(val.clone());
-        }
-
-        // 3. SSTables (newest first)
-        let ssts = unsafe { &*self.sstables.get() };
-        for (meta, data) in ssts.iter().rev() {
-            if let Some(val) = meta.get(key, data) {
-                if val.is_empty() { return None; }
-                self.cache.put(key, &val);
-                return Some(val);
-            }
-        }
-
-        None
-    }
-
-    fn delete(&self, key: &[u8]) -> io::Result<()> {
-        self.wal.lock().unwrap().append(key, &[], WAL_DELETE)?;
-        let mt = unsafe { &mut *self.memtable.get() };
-        mt.insert(key.to_vec(), Vec::new());
-        self.cache.delete(key);
-        Ok(())
-    }
-
-    fn flush(&self) -> io::Result<()> {
-        let mt = unsafe { &*self.memtable.get() };
-        if mt.is_empty() { return Ok(()); }
-
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = mt.iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        if entries.is_empty() { return Ok(()); }
-
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let path = SSTableMeta::create(&entries, &self.data_dir, seq)?;
-
-        let meta = SSTableMeta::open(&path)?;
-        let file = File::open(&path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let data: Vec<u8> = mmap.to_vec();
-
-        let ssts = unsafe { &mut *self.sstables.get() };
-        ssts.push((meta, Arc::new(data)));
-
-        let mt_mut = unsafe { &mut *self.memtable.get() };
-        mt_mut.clear();
-        self.memtable_size.store(0, Ordering::Relaxed);
-
-        self.wal.lock().unwrap().truncate()?;
-        Ok(())
-    }
-
-    fn compact(&self) -> io::Result<()> {
-        let ssts = unsafe { &*self.sstables.get() };
-        if ssts.len() < 2 { return Ok(()); }
-
-        let mut merged = BTreeMap::new();
-        for (meta, data) in ssts.iter() {
-            for (key, value) in meta.iter_all(data) {
-                if !value.is_empty() {
-                    merged.insert(key, value);
-                }
-            }
-        }
-
-        if merged.is_empty() { return Ok(()); }
-
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = merged.into_iter().collect();
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let path = SSTableMeta::create(&entries, &self.data_dir, seq)?;
-
-        let old_paths: Vec<PathBuf> = ssts.iter().map(|(m, _)| m.path.clone()).collect();
-        for p in &old_paths { fs::remove_file(p).ok(); }
-
-        let ssts_mut = unsafe { &mut *self.sstables.get() };
-        ssts_mut.clear();
-
-        let meta = SSTableMeta::open(&path)?;
-        let file = File::open(&path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let data: Vec<u8> = mmap.to_vec();
-        ssts_mut.push((meta, Arc::new(data)));
-
-        Ok(())
-    }
-
-    fn needs_flush(&self) -> bool {
-        self.memtable_size.load(Ordering::Relaxed) >= self.memtable_size_limit
-    }
-
-    fn close(&self) -> io::Result<()> {
-        self.flush()?;
-        self.wal.lock().unwrap().close()?;
-        Ok(())
-    }
-
-    fn memtable_len(&self) -> usize {
-        let mt = unsafe { &*self.memtable.get() };
-        mt.len()
-    }
-    fn memtable_bytes(&self) -> u64 { self.memtable_size.load(Ordering::Relaxed) }
-    fn sstable_count(&self) -> usize {
-        let ssts = unsafe { &*self.sstables.get() };
-        ssts.len()
     }
 }
 
@@ -634,94 +161,63 @@ impl LSMEngine {
 // C FFI Interface
 // ============================================================
 
-fn alloc_bytes(data: &[u8]) -> (*mut u8, usize) {
-    let len = data.len();
-    if len == 0 { return (std::ptr::null_mut(), 0); }
-    let mut v = Vec::with_capacity(len);
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), v.as_mut_ptr(), len); }
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    (ptr, len)
+/// Opaque handle for SortedMap
+#[no_mangle]
+pub extern "C" fn ignis_sorted_map_new() -> *mut SortedMap {
+    Box::into_raw(Box::new(SortedMap::new()))
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_engine_open(
-    data_dir: *const u8, data_dir_len: usize,
-    memtable_size_limit: u64,
-    cache_entries: usize,
-) -> *mut LSMEngine {
-    if data_dir.is_null() { return std::ptr::null_mut(); }
-    let dir = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(data_dir, data_dir_len)) };
-    match LSMEngine::open(dir, memtable_size_limit, cache_entries) {
-        Ok(engine) => Box::into_raw(Box::new(engine)),
-        Err(_) => std::ptr::null_mut(),
+pub extern "C" fn ignis_sorted_map_free(ptr: *mut SortedMap) {
+    if !ptr.is_null() {
+        unsafe { drop(Box::from_raw(ptr)); }
     }
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_engine_close(ptr: *mut LSMEngine) -> i32 {
-    if ptr.is_null() { return -1; }
-    let engine = unsafe { Box::from_raw(ptr) };
-    match engine.close() { Ok(_) => 0, Err(_) => -1 }
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_put(
-    ptr: *mut LSMEngine,
-    key: *const u8, key_len: usize,
-    value: *const u8, value_len: usize,
-) -> i32 {
-    if ptr.is_null() || key.is_null() || value.is_null() { return -1; }
-    let engine = unsafe { &*ptr };
+pub extern "C" fn ignis_sorted_map_put(
+    ptr: *mut SortedMap,
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+) {
+    if ptr.is_null() || key.is_null() || value.is_null() {
+        return;
+    }
+    let map = unsafe { &*ptr };
     let k = unsafe { std::slice::from_raw_parts(key, key_len) };
     let v = unsafe { std::slice::from_raw_parts(value, value_len) };
-    match engine.put(k, v) {
-        Ok(_) => {
-            if engine.needs_flush() { engine.flush().ok(); }
-            0
-        }
-        Err(_) => -1,
-    }
+    map.put(k, v);
 }
 
-/// Batch put - amortizes CGo overhead for multiple writes
+/// Returns value via out_value/out_len. Caller must free with ignis_free_bytes.
+/// Returns 1 if found, 0 if not.
 #[no_mangle]
-pub extern "C" fn ignis_engine_batch_put(
-    ptr: *mut LSMEngine,
-    keys: *const *const u8, key_lens: *const usize,
-    values: *const *const u8, value_lens: *const usize,
-    count: usize,
+pub extern "C" fn ignis_sorted_map_get(
+    ptr: *mut SortedMap,
+    key: *const u8,
+    key_len: usize,
+    out_value: *mut *mut u8,
+    out_len: *mut usize,
 ) -> i32 {
-    if ptr.is_null() || keys.is_null() || values.is_null() { return -1; }
-    let engine = unsafe { &*ptr };
-    let ks = unsafe { std::slice::from_raw_parts(keys, count) };
-    let kls = unsafe { std::slice::from_raw_parts(key_lens, count) };
-    let vs = unsafe { std::slice::from_raw_parts(values, count) };
-    let vls = unsafe { std::slice::from_raw_parts(value_lens, count) };
-
-    for i in 0..count {
-        let k = unsafe { std::slice::from_raw_parts(ks[i], kls[i]) };
-        let v = unsafe { std::slice::from_raw_parts(vs[i], vls[i]) };
-        if engine.put(k, v).is_err() { return -1; }
+    if ptr.is_null() || key.is_null() || out_value.is_null() || out_len.is_null() {
+        return 0;
     }
-
-    if engine.needs_flush() { engine.flush().ok(); }
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_get(
-    ptr: *mut LSMEngine,
-    key: *const u8, key_len: usize,
-    out_value: *mut *mut u8, out_len: *mut usize,
-) -> i32 {
-    if ptr.is_null() || key.is_null() || out_value.is_null() || out_len.is_null() { return 0; }
-    let engine = unsafe { &*ptr };
+    let map = unsafe { &*ptr };
     let k = unsafe { std::slice::from_raw_parts(key, key_len) };
-    match engine.get(k) {
-        Some(val) => {
-            let (ptr, len) = alloc_bytes(&val);
-            unsafe { *out_value = ptr; *out_len = len; }
+    match map.get(k) {
+        Some(v) => {
+            let len = v.len();
+            let buf = unsafe { libc_malloc(len) };
+            if buf.is_null() {
+                return 0;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr(), buf, len);
+                *out_value = buf;
+                *out_len = len;
+            }
             1
         }
         None => 0,
@@ -729,73 +225,115 @@ pub extern "C" fn ignis_engine_get(
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_engine_delete(
-    ptr: *mut LSMEngine,
-    key: *const u8, key_len: usize,
+pub extern "C" fn ignis_sorted_map_delete(
+    ptr: *mut SortedMap,
+    key: *const u8,
+    key_len: usize,
 ) -> i32 {
-    if ptr.is_null() || key.is_null() { return -1; }
-    let engine = unsafe { &*ptr };
+    if ptr.is_null() || key.is_null() {
+        return 0;
+    }
+    let map = unsafe { &*ptr };
     let k = unsafe { std::slice::from_raw_parts(key, key_len) };
-    match engine.delete(k) { Ok(_) => 0, Err(_) => -1 }
+    if map.delete(k) { 1 } else { 0 }
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_engine_flush(ptr: *mut LSMEngine) -> i32 {
-    if ptr.is_null() { return -1; }
-    match unsafe { &*ptr }.flush() { Ok(_) => 0, Err(_) => -1 }
+pub extern "C" fn ignis_sorted_map_len(ptr: *mut SortedMap) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let map = unsafe { &*ptr };
+    map.len()
 }
 
+/// Returns all entries as flat buffer: [key_len(4)][key][value_len(4)][value]...
+/// Caller must free with ignis_free_bytes.
 #[no_mangle]
-pub extern "C" fn ignis_engine_compact(ptr: *mut LSMEngine) -> i32 {
-    if ptr.is_null() { return -1; }
-    match unsafe { &*ptr }.compact() { Ok(_) => 0, Err(_) => -1 }
+pub extern "C" fn ignis_sorted_map_iter_all(
+    ptr: *mut SortedMap,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) {
+    if ptr.is_null() || out_data.is_null() || out_len.is_null() {
+        return;
+    }
+    let map = unsafe { &*ptr };
+    let buf = map.iter_all();
+    let len = buf.len();
+    if len == 0 {
+        unsafe {
+            *out_data = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return;
+    }
+    let ptr_out = libc_malloc(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr_out, len);
+        *out_data = ptr_out;
+        *out_len = len;
+    }
 }
 
-#[no_mangle]
-pub extern "C" fn ignis_engine_memtable_len(ptr: *mut LSMEngine) -> usize {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.memtable_len()
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_memtable_bytes(ptr: *mut LSMEngine) -> u64 {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.memtable_bytes()
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_sstable_count(ptr: *mut LSMEngine) -> usize {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.sstable_count()
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_stats_writes(ptr: *mut LSMEngine) -> u64 {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.stats_writes.load(Ordering::Relaxed)
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_stats_reads(ptr: *mut LSMEngine) -> u64 {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.stats_reads.load(Ordering::Relaxed)
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_stats_cache_hits(ptr: *mut LSMEngine) -> u64 {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.cache.hits()
-}
-
-#[no_mangle]
-pub extern "C" fn ignis_engine_stats_cache_misses(ptr: *mut LSMEngine) -> u64 {
-    if ptr.is_null() { return 0; }
-    unsafe { &*ptr }.cache.misses()
-}
-
+/// Free bytes allocated by Rust
 #[no_mangle]
 pub extern "C" fn ignis_free_bytes(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
-        unsafe { let _ = Vec::from_raw_parts(ptr, len, len); }
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, len, len);
+        }
     }
+}
+
+// Simple malloc wrapper for FFI
+fn libc_malloc(size: usize) -> *mut u8 {
+    let mut v = Vec::with_capacity(size);
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v);
+    ptr
+}
+
+// ============================================================
+// Bloom Filter FFI
+// ============================================================
+
+#[no_mangle]
+pub extern "C" fn ignis_bloom_new(expected_items: usize, fp_rate: f64) -> *mut BloomFilter {
+    Box::into_raw(Box::new(BloomFilter::new(expected_items, fp_rate)))
+}
+
+#[no_mangle]
+pub extern "C" fn ignis_bloom_free(ptr: *mut BloomFilter) {
+    if !ptr.is_null() {
+        unsafe { drop(Box::from_raw(ptr)); }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ignis_bloom_add(
+    ptr: *mut BloomFilter,
+    key: *const u8,
+    key_len: usize,
+) {
+    if ptr.is_null() || key.is_null() {
+        return;
+    }
+    let bf = unsafe { &mut *ptr };
+    let k = unsafe { std::slice::from_raw_parts(key, key_len) };
+    bf.add(k);
+}
+
+#[no_mangle]
+pub extern "C" fn ignis_bloom_might_contain(
+    ptr: *mut BloomFilter,
+    key: *const u8,
+    key_len: usize,
+) -> i32 {
+    if ptr.is_null() || key.is_null() {
+        return 0;
+    }
+    let bf = unsafe { &*ptr };
+    let k = unsafe { std::slice::from_raw_parts(key, key_len) };
+    if bf.might_contain(k) { 1 } else { 0 }
 }

@@ -1,15 +1,12 @@
 [package]
 name = "ignisdb-core"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
 
 [lib]
 crate-type = ["staticlib"]
 
 [dependencies]
-memmap2 = "0.9"
-crc32fast = "1.4"
-dashmap = "6"
 
 [profile.release]
 opt-level = 3
